@@ -95,8 +95,7 @@ extension UWBTracker: NISessionDelegate {
     func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
         guard let peer = peer(for: session), let obj = nearbyObjects.first, var r = readings[peer] else { return }
         r.distance = obj.distance
-        let t = session.worldTransform(for: obj)
-        if t != NINearbyObject.worldTransformNotAvailable {
+        if let t = session.worldTransform(for: obj) {
             let p = SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
             r.worldPosition = (p.x.isFinite && p.y.isFinite && p.z.isFinite) ? p : nil
         } else {
