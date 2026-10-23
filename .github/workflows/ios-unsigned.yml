@@ -1,0 +1,55 @@
+# Builds an UNSIGNED iPhone app on GitHub's Macs. Download the .ipa from the run's
+# "Artifacts" section and install it with Sideloadly (Windows) using your free Apple ID.
+#
+# Debug   = development client: loads your JS live from `npx expo start` (rebuild only when Swift changes)
+# Release = standalone: JS bundled inside, works without your PC
+name: iOS unsigned build
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Debug (dev client) or Release (standalone)
+        type: choice
+        options: [Debug, Release]
+        default: Debug
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate native iOS project (also runs pod install)
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Build without code signing
+        run: |
+          WS=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WS" .xcworkspace)
+          xcodebuild -workspace "$WS" -scheme "$SCHEME" \
+            -configuration "${{ inputs.configuration }}" \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tail -n 80
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Package .ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/${{ inputs.configuration }}-iphoneos/*.app Payload/
+          zip -qr UWBHud-${{ inputs.configuration }}-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UWBHud-${{ inputs.configuration }}-unsigned
+          path: UWBHud-${{ inputs.configuration }}-unsigned.ipa
