@@ -1,7 +1,7 @@
 # Builds an UNSIGNED iPhone app on GitHub's Macs. Download the .ipa from the run's
 # "Artifacts" section and install it with Sideloadly (Windows) using your free Apple ID.
 #
-# Debug   = development client: loads your JS live from `npx expo start` (rebuild only when Swift changes)
+# Debug   = development client: loads your JS live from `npx expo start`
 # Release = standalone: JS bundled inside, works without your PC
 name: iOS unsigned build
 
@@ -19,11 +19,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
@@ -35,13 +35,28 @@ jobs:
         run: |
           WS=$(ls -d ios/*.xcworkspace | head -1)
           SCHEME=$(basename "$WS" .xcworkspace)
-          xcodebuild -workspace "$WS" -scheme "$SCHEME" \
-            -configuration "${{ inputs.configuration }}" \
-            -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build | tail -n 80
-          test ${PIPESTATUS[0]} -eq 0
+          echo "Xcode: $(xcodebuild -version | head -1)  Workspace: $WS  Scheme: $SCHEME"
+          if ! xcodebuild -workspace "$WS" -scheme "$SCHEME" \
+               -configuration "${{ inputs.configuration }}" \
+               -sdk iphoneos -destination 'generic/platform=iOS' \
+               -derivedDataPath build \
+               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+               build > xcodebuild.log 2>&1; then
+            echo "================ ERRORS ================"
+            grep -nE "error:|fatal error|ld: |Undefined symbol" xcodebuild.log | head -100
+            echo "================ FAILED COMMANDS ================"
+            grep -A 15 "The following build commands failed" xcodebuild.log
+            exit 1
+          fi
+          tail -n 20 xcodebuild.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
 
       - name: Package .ipa
         run: |
@@ -53,4 +68,3 @@ jobs:
         with:
           name: UWBHud-${{ inputs.configuration }}-unsigned
           path: UWBHud-${{ inputs.configuration }}-unsigned.ipa
-# registered
