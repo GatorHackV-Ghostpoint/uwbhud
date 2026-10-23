@@ -53,3 +53,4 @@ jobs:
         with:
           name: UWBHud-${{ inputs.configuration }}-unsigned
           path: UWBHud-${{ inputs.configuration }}-unsigned.ipa
+# registered
