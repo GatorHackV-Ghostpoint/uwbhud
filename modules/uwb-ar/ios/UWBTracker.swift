@@ -2,13 +2,60 @@ import ARKit
 import MultipeerConnectivity
 import NearbyInteraction
 
+/// One Euro filter (https://gery.casiez.net/1euro/): smooths hard while the target is still,
+/// and loosens up as it moves so the marker doesn't lag behind someone walking.
+struct OneEuroFilter {
+    let minCutoff: SIMD3<Float>   // Hz per axis; lower = steadier when still
+    let beta: Float               // how fast the cutoff rises with speed
+    let dCutoff: Float = 1
+    private var x: SIMD3<Float>?
+    private var dx = SIMD3<Float>(repeating: 0)
+    private var t: TimeInterval = 0
+
+    init(minCutoff: SIMD3<Float>, beta: Float) {
+        self.minCutoff = minCutoff
+        self.beta = beta
+    }
+
+    private static func alpha(_ cutoff: SIMD3<Float>, _ dt: Float) -> SIMD3<Float> {
+        let tau = 1 / (2 * Float.pi * cutoff)
+        return 1 / (1 + tau / dt)
+    }
+
+    mutating func filter(_ value: SIMD3<Float>, at time: TimeInterval) -> SIMD3<Float> {
+        guard let prev = x, time > t else { x = value; t = time; dx = .zero; return value }
+        let dt = Float(time - t)
+        t = time
+        dx += Self.alpha(SIMD3(repeating: dCutoff), dt) * ((value - prev) / dt - dx)
+        let speed = SIMD3(abs(dx.x), abs(dx.y), abs(dx.z))
+        let next = prev + Self.alpha(minCutoff + beta * speed, dt) * (value - prev)
+        x = next
+        return next
+    }
+
+    mutating func reset() { x = nil }
+}
+
 /// Latest UWB reading for one nearby phone.
 struct PeerReading {
     var name: String
     var distance: Float?               // meters, whenever UWB has a reading
     var worldPosition: SIMD3<Float>?   // in OUR ARKit world, once camera assistance has converged
     var guidance: String?              // what the user should do to get a direction fix
-    var lastUpdate: TimeInterval = 0
+    var cameraAssist = false           // this peer's session uses camera assistance
+    var assistActive = false           // camera assistance has reported in at least once
+    var lastUpdate: TimeInterval = 0   // 0 = no reading yet
+    var positionTime: TimeInterval = 0 // when worldPosition was last measured
+    var recent: [SIMD3<Float>] = []    // last few raw positions, for rejecting one-off bad readings
+    // Up/down (y) gets a lower cutoff: UWB elevation is the noisiest axis and people rarely move vertically.
+    var positionFilter = OneEuroFilter(minCutoff: SIMD3(0.4, 0.15, 0.4), beta: 0.8)
+    var distanceFilter = OneEuroFilter(minCutoff: SIMD3(repeating: 0.5), beta: 0.5)   // only .x is used
+}
+
+/// Per-axis median, so a single reflected reading can't yank the marker.
+private func median(_ points: [SIMD3<Float>]) -> SIMD3<Float> {
+    func mid(_ xs: [Float]) -> Float { xs.sorted()[xs.count / 2] }
+    return SIMD3(mid(points.map(\.x)), mid(points.map(\.y)), mid(points.map(\.z)))
 }
 
 /// Runs one Nearby Interaction session per nearby phone. With camera assistance,
@@ -21,10 +68,20 @@ final class UWBTracker: NSObject {
     private let arSession: ARSession
     private let link: PeerLink
     private var sessions: [MCPeerID: NISession] = [:]
-    private var tokens: [MCPeerID: NIDiscoveryToken] = [:]   // remembered to restart after interruptions
+    private var tokens: [MCPeerID: NIDiscoveryToken] = [:]   // their token, remembered to restart after interruptions
+    private var restarts: [MCPeerID: Int] = [:]
+    private var plainSessions = Set<MCPeerID>()   // peers where iOS rejected camera assistance
 
     static var isSupported: Bool { NISession.deviceCapabilities.supportsPreciseDistanceMeasurement }
     static var supportsCameraAssistance: Bool { NISession.deviceCapabilities.supportsCameraAssistance }
+    /// iPhone 11–13: UWB alone gives direction. iPhone 14+ only gets direction via camera assistance.
+    static var supportsDirection: Bool { NISession.deviceCapabilities.supportsDirectionMeasurement }
+
+    /// Only use camera assistance when it's the sole way to get direction: on iPhone 12 (iOS 26/27)
+    /// iOS never issues a discovery token while the camera is attached, even with ARKit tracking fine.
+    private func usesAssist(_ peer: MCPeerID) -> Bool {
+        Self.supportsCameraAssistance && !Self.supportsDirection && !plainSessions.contains(peer)
+    }
 
     init(arSession: ARSession, displayName: String) {
         self.arSession = arSession
@@ -33,12 +90,19 @@ final class UWBTracker: NSObject {
         link.onConnected = { [weak self] in self?.connected($0) }
         link.onDisconnected = { [weak self] in self?.disconnected($0) }
         link.onToken = { [weak self] in self?.received(token: $1, from: $0) }
+        link.onLog = { [weak self] in self?.note($0) }
+    }
+
+    /// Show a step on screen and in the Mac's Console app (search "[UWBHud]").
+    private func note(_ text: String) {
+        status = text
+        NSLog("[UWBHud] %@", text)
     }
 
     func start() {
-        guard Self.isSupported else { status = "This iPhone has no UWB chip"; return }
+        guard Self.isSupported else { note("This iPhone has no UWB chip"); return }
         link.start()
-        status = "Looking for the other phone…"
+        note("Looking for the other phone…")
     }
 
     func stop() {
@@ -50,40 +114,111 @@ final class UWBTracker: NSObject {
     // MARK: Handshake
 
     private func connected(_ peer: MCPeerID) {
-        status = "Connected to \(peer.displayName). Starting UWB…"
-        let s = sessions[peer] ?? makeSession(for: peer)
-        if let token = s.discoveryToken { link.send(token: token, to: peer) }
+        note("Connected to \(peer.displayName). Preparing UWB token…")
+        if sessions[peer] == nil { _ = makeSession(for: peer) }
+        if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
+        sendToken(to: peer, attempt: 1)
     }
 
     private func makeSession(for peer: MCPeerID) -> NISession {
         let s = NISession()
         s.delegate = self
         s.delegateQueue = .main
-        if Self.supportsCameraAssistance { s.setARSession(arSession) }   // must be set before run()
+        // Attach the camera straight away: attaching it later (after the token exists) makes
+        // iOS reject it with NIERROR_INVALID_AR_SESSION_DESCRIPTION.
+        let assist = usesAssist(peer)
+        if assist { s.setARSession(arSession) }
         sessions[peer] = s
-        readings[peer] = PeerReading(name: peer.displayName)
+        readings[peer] = PeerReading(name: peer.displayName, cameraAssist: assist)
         return s
     }
 
+    /// Camera (ARKit) state as NI sees it, for diagnosing camera-assistance problems.
+    private var arInfo: String {
+        guard let cfg = arSession.configuration else { return "AR not running" }
+        guard let world = cfg as? ARWorldTrackingConfiguration else { return "AR: \(type(of: cfg))" }
+        let align = world.worldAlignment == .gravity ? "gravity" : "alignment \(world.worldAlignment.rawValue)"
+        guard let frame = arSession.currentFrame else { return "AR \(align), no frames" }
+        let tracking: String
+        switch frame.camera.trackingState {
+        case .normal: tracking = "tracking ok"
+        case .notAvailable: tracking = "tracking unavailable"
+        case .limited(let reason): tracking = "tracking limited (\(reason))"
+        }
+        return String(format: "AR %@, %@, frame %.1fs old", align, tracking, CACurrentMediaTime() - frame.timestamp)
+    }
+
+    /// Sends our token, and keeps resending every 2 s until we have theirs (up to 10 tries).
+    private func sendToken(to peer: MCPeerID, attempt: Int) {
+        guard let s = sessions[peer] else { return }
+        guard let token = s.discoveryToken else {
+            let assist = usesAssist(peer)
+            if assist && attempt == 6 {
+                // iOS won't issue a token with the camera attached; carry on with distance only.
+                note("Camera assistance gave no token [\(arInfo)]. Distance only…")
+                sessions[peer] = nil          // detach first so the invalidate callback ignores it
+                s.invalidate()
+                plainSessions.insert(peer)
+                _ = makeSession(for: peer)
+            } else {
+                note("Waiting for iOS to create the UWB token (try \(attempt))… [\(assist ? arInfo : "no camera assist")]")
+            }
+            if attempt < 12 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    self?.sendToken(to: peer, attempt: attempt + 1)
+                }
+            } else {
+                note("iOS never created a UWB token. Check Settings → UWBHud → Nearby Interactions")
+            }
+            return
+        }
+        if let err = link.send(token: token, to: peer) {
+            note("Token send failed (try \(attempt)): \(err)")
+        } else if tokens[peer] == nil {
+            note("Sent UWB token to \(peer.displayName) (try \(attempt)). Waiting for theirs…")
+        }
+        guard tokens[peer] == nil, attempt < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.tokens[peer] == nil, self.link.isConnected(peer) else { return }
+            self.sendToken(to: peer, attempt: attempt + 1)
+        }
+    }
+
     private func received(token: NIDiscoveryToken, from peer: MCPeerID) {
-        if sessions[peer] == nil { connected(peer) }  // token beat the connect callback
+        if sessions[peer] == nil {
+            // Token beat the connect callback, or our session just failed. Don't rebuild a
+            // session that keeps failing: that's what made the status flip endlessly.
+            guard (restarts[peer] ?? 0) <= 3 else { return }
+            connected(peer)
+        }
+        let isRepeat = tokens[peer] == token
+        if isRepeat {
+            // They're resending, so they haven't got ours yet. Reply once more.
+            sendToken(to: peer, attempt: 10)
+            return
+        }
         tokens[peer] = token
+        note("Got token from \(peer.displayName). Starting UWB…")
         run(peer)
+        sendToken(to: peer, attempt: 10)   // make sure they have ours too
     }
 
     private func run(_ peer: MCPeerID) {
         guard let s = sessions[peer], let token = tokens[peer] else { return }
         let config = NINearbyPeerConfiguration(peerToken: token)
-        if Self.supportsCameraAssistance { config.isCameraAssistanceEnabled = true }
+        if usesAssist(peer) { config.isCameraAssistanceEnabled = true }
         s.run(config)
-        status = "Ranging with \(peer.displayName)"
+        note("UWB started with \(peer.displayName). Waiting for first reading…")
     }
 
     private func disconnected(_ peer: MCPeerID) {
-        sessions.removeValue(forKey: peer)?.invalidate()
-        tokens[peer] = nil
-        readings[peer] = nil
-        status = link.isConnected ? status : "Looking for the other phone…"
+        // Keep the UWB session: once tokens are swapped, UWB keeps working without this link,
+        // and tearing it down mid-setup is what killed the token before.
+        if tokens[peer] == nil {
+            note("Link to \(peer.displayName) dropped before UWB started. Reconnecting…")
+        } else {
+            note("Link to \(peer.displayName) dropped; UWB continues")
+        }
     }
 
     private func peer(for session: NISession) -> MCPeerID? {
@@ -94,14 +229,32 @@ final class UWBTracker: NSObject {
 extension UWBTracker: NISessionDelegate {
     func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
         guard let peer = peer(for: session), let obj = nearbyObjects.first, var r = readings[peer] else { return }
-        r.distance = obj.distance
+        if r.lastUpdate == 0 { note("Ranging with \(peer.displayName)") }
+        let now = CACurrentMediaTime()
+        if let d = obj.distance { r.distance = r.distanceFilter.filter(SIMD3(repeating: d), at: now).x }
+        var p: SIMD3<Float>?
         if let t = session.worldTransform(for: obj) {
-            let p = SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
-            r.worldPosition = (p.x.isFinite && p.y.isFinite && p.z.isFinite) ? p : nil
-        } else {
-            r.worldPosition = nil
+            p = SIMD3(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        } else if let dir = obj.direction, let d = obj.distance, let frame = arSession.currentFrame {
+            // No camera-assisted fix (e.g. iPhone 11–13 without assistance): UWB's own direction is
+            // relative to the phone held upright (x right, y up, -z out the back), same as the
+            // portrait camera space, so place it in the AR world through the current camera pose.
+            let w = frame.camera.viewMatrix(for: .portrait).inverse * SIMD4(dir * d, 1)
+            p = SIMD3(w.x, w.y, w.z)
         }
-        r.lastUpdate = CACurrentMediaTime()
+        if let q = p, q.x.isFinite, q.y.isFinite, q.z.isFinite {
+            if now - r.positionTime > 1.5 {   // after a real gap, start fresh rather than sliding from the old spot
+                r.recent.removeAll()
+                r.positionFilter.reset()
+            }
+            r.recent.append(q)
+            if r.recent.count > 5 { r.recent.removeFirst() }
+            r.worldPosition = r.positionFilter.filter(median(r.recent), at: now)
+            r.positionTime = now
+        } else if now - r.positionTime > 1.5 {
+            r.worldPosition = nil   // UWB often skips direction for a reading or two; only drop it after a real gap
+        }
+        r.lastUpdate = now
         readings[peer] = r
     }
 
@@ -109,6 +262,7 @@ extension UWBTracker: NISessionDelegate {
     func session(_ session: NISession, didUpdateAlgorithmConvergence convergence: NIAlgorithmConvergence,
                  for object: NINearbyObject?) {
         guard let peer = peer(for: session) else { return }
+        readings[peer]?.assistActive = true
         switch convergence.status {
         case .converged:
             readings[peer]?.guidance = nil
@@ -131,11 +285,14 @@ extension UWBTracker: NISessionDelegate {
         guard let peer = peer(for: session) else { return }
         if reason == .timeout {
             readings[peer]?.worldPosition = nil   // out of range / blocked; keep session for when they return
+            note("UWB timed out with \(peer.displayName) (out of range or blocked?)")
+        } else if reason == .peerEnded {
+            note("\(peer.displayName) stopped UWB")
         }
     }
 
     func sessionWasSuspended(_ session: NISession) {
-        status = "UWB paused (app in background?)"
+        note("UWB paused (app in background?)")
     }
 
     func sessionSuspensionEnded(_ session: NISession) {
@@ -144,10 +301,26 @@ extension UWBTracker: NISessionDelegate {
 
     func session(_ session: NISession, didInvalidateWith error: Error) {
         guard let peer = peer(for: session) else { return }
-        status = "UWB restarted: \(error.localizedDescription)"
+        let code = (error as NSError).code
+        if let ni = error as? NIError, ni.code == .userDidNotAllow {
+            note("Nearby Interaction not allowed. Turn it on: Settings → UWBHud → Nearby Interactions")
+        } else if let ni = error as? NIError, ni.code == .invalidARConfiguration, !plainSessions.contains(peer) {
+            // Keep distance working rather than failing outright; direction needs camera assistance.
+            plainSessions.insert(peer)
+            note("iOS rejected camera assistance (\(error.localizedDescription)). Distance only for \(peer.displayName)")
+        } else {
+            note("UWB error \(code): \(error.localizedDescription) [\(arInfo)]")
+        }
         sessions[peer] = nil
-        // A fresh session has a new token; send it again so the other phone can re-run.
-        connected(peer)
-        run(peer)
+        let n = (restarts[peer] ?? 0) + 1
+        restarts[peer] = n
+        guard n <= 3, link.isConnected(peer) else { return }   // don't loop forever
+        // A fresh session has a new token; send it so the other phone can re-run with it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.sessions[peer] == nil else { return }   // a new token may have rebuilt it already
+            _ = self.makeSession(for: peer)
+            self.sendToken(to: peer, attempt: 1)
+            self.run(peer)
+        }
     }
 }

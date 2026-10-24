@@ -41,8 +41,8 @@ export default function App() {
         <Text style={styles.cardText}>
           {name} · {status?.status ?? 'Starting…'}
         </Text>
-        {status && !status.cameraAssist && (
-          <Text style={styles.warn}>No camera assistance on this model: distance only</Text>
+        {status && !status.directionSupported && (
+          <Text style={styles.warn}>This iPhone can measure distance but not direction</Text>
         )}
       </View>
 
@@ -51,7 +51,11 @@ export default function App() {
           {waiting.map((p) => (
             <Text key={p.id} style={styles.cardText}>
               {p.name}: {formatDistance(p.distance)}
-              {p.stale ? ' (signal lost)' : `. ${p.guidance ?? 'Finding direction…'}`}
+              {p.stale
+                ? ' (signal lost)'
+                : p.distance == null
+                  ? '. Waiting for UWB…'
+                  : `. ${p.guidance ?? directionHint(p)}`}
             </Text>
           ))}
         </View>
@@ -91,6 +95,11 @@ function PeerMarker({ peer }: { peer: UwbPeer }) {
       <Text style={styles.edgeText}>{formatDistance(peer.distance)}</Text>
     </View>
   );
+}
+
+function directionHint(p: UwbPeer) {
+  if (!p.cameraAssist) return 'Point the back of your phone toward them';
+  return p.assistActive ? 'Finding direction…' : 'Finding direction… (camera assist not responding)';
 }
 
 function formatDistance(m?: number) {

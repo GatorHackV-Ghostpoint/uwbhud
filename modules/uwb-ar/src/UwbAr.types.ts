@@ -8,6 +8,10 @@ export type UwbPeer = {
   distance?: number;
   /** True once camera assistance has locked direction. */
   hasPosition: boolean;
+  /** This peer's session uses camera assistance (iPhone 14+); otherwise direction comes from UWB alone. */
+  cameraAssist: boolean;
+  /** Camera assistance has reported in for this peer. */
+  assistActive: boolean;
   /** Peer is in front of the camera (x/y are valid on-screen points). */
   inFront: boolean;
   /** Screen position in points, relative to the view. */
@@ -24,7 +28,8 @@ export type UwbPeer = {
 
 export type UwbStatus = {
   status: string;
-  cameraAssist: boolean;
+  /** This iPhone can find direction (UWB alone or with camera assistance), not just distance. */
+  directionSupported: boolean;
   uwbSupported: boolean;
 };
 
