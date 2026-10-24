@@ -8,6 +8,7 @@ final class PeerLink: NSObject {
     var onConnected: ((MCPeerID) -> Void)?
     var onDisconnected: ((MCPeerID) -> Void)?
     var onToken: ((MCPeerID, NIDiscoveryToken) -> Void)?
+    var onLog: ((String) -> Void)?
 
     static let serviceType = "uwbhud"            // must match NSBonjourServices in Info.plist
     private static let inviteContext = Data("uwbhud-v1".utf8)
@@ -20,7 +21,8 @@ final class PeerLink: NSObject {
 
     init(displayName: String) {
         myPeer = MCPeerID(displayName: displayName)
-        session = MCSession(peer: myPeer, securityIdentity: nil, encryptionPreference: .required)
+        // .optional avoids the encryption handshake, which has been seen to drop new connections.
+        session = MCSession(peer: myPeer, securityIdentity: nil, encryptionPreference: .optional)
         advertiser = MCNearbyServiceAdvertiser(peer: myPeer, discoveryInfo: ["r": myRank],
                                                serviceType: Self.serviceType)
         browser = MCNearbyServiceBrowser(peer: myPeer, serviceType: Self.serviceType)
@@ -41,11 +43,19 @@ final class PeerLink: NSObject {
         session.disconnect()
     }
 
-    func send(token: NIDiscoveryToken, to peer: MCPeerID) {
-        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true) else { return }
-        try? session.send(data, toPeers: [peer], with: .reliable)
+    /// Returns nil on success, or a description of what went wrong.
+    func send(token: NIDiscoveryToken, to peer: MCPeerID) -> String? {
+        guard session.connectedPeers.contains(peer) else { return "not connected to \(peer.displayName) yet" }
+        do {
+            let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+            try session.send(data, toPeers: [peer], with: .reliable)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
+    func isConnected(_ peer: MCPeerID) -> Bool { session.connectedPeers.contains(peer) }
     var isConnected: Bool { !session.connectedPeers.isEmpty }
 }
 
@@ -58,6 +68,14 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
 
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {}
 
+    func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) {
+        DispatchQueue.main.async { self.onLog?("Can't search for phones: \(error.localizedDescription)") }
+    }
+
+    func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
+        DispatchQueue.main.async { self.onLog?("Can't advertise: \(error.localizedDescription)") }
+    }
+
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID,
                     withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
         invitationHandler(context == Self.inviteContext, session)
@@ -67,15 +85,22 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
         DispatchQueue.main.async {
             switch state {
             case .connected: self.onConnected?(peerID)
-            case .notConnected: self.onDisconnected?(peerID)
+            case .notConnected:
+                self.onDisconnected?(peerID)
+                // Search again so the phones find each other and reconnect.
+                self.browser.stopBrowsingForPeers()
+                self.browser.startBrowsingForPeers()
             default: break
             }
         }
     }
 
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
-        guard let token = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: data) else { return }
-        DispatchQueue.main.async { self.onToken?(peerID, token) }
+        let token = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: data)
+        DispatchQueue.main.async {
+            if let token { self.onToken?(peerID, token) }
+            else { self.onLog?("Got \(data.count) bytes from \(peerID.displayName) but it wasn't a UWB token") }
+        }
     }
 
     func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {}

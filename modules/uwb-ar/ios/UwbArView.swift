@@ -79,15 +79,15 @@ final class UwbArView: ExpoView {
 
         for (peer, r) in tracker.readings {
             seen.insert(peer)
-            let stale = now - r.lastUpdate > 2
+            let stale = r.lastUpdate > 0 && now - r.lastUpdate > 2   // 0 = no reading yet, not "lost"
             var item: [String: Any] = ["id": "\(peer.hash)", "name": r.name, "stale": stale,
-                                       "hasPosition": false, "inFront": false,
+                                       "hasPosition": false, "inFront": false, "cameraAssist": r.cameraAssist, "assistActive": r.assistActive,
                                        "x": 0, "y": 0, "dirX": 0, "dirY": 0]
             if let d = r.distance { item["distance"] = Double(d) }
             if let g = r.guidance { item["guidance"] = g }
 
             if let target = r.worldPosition, !stale {
-                // Smooth UWB jitter so the dot glides instead of shaking.
+                // The tracker already filters the readings; this just glides between UWB updates.
                 let p = smoothed[peer].map { $0 + (target - $0) * 0.25 } ?? target
                 smoothed[peer] = p
                 let marker = markers[peer] ?? makeMarker(peer)
@@ -115,15 +115,15 @@ final class UwbArView: ExpoView {
             smoothed[peer] = nil
         }
 
-        // ~15 updates/sec is plenty for React to draw labels smoothly.
-        if now - lastEmit >= 0.066 {
+        // ~30 updates/sec so the labels glide with the camera instead of stepping.
+        if now - lastEmit >= 0.033 {
             lastEmit = now
             onPeers(["peers": payload])
         }
         if tracker.status != lastStatus {
             lastStatus = tracker.status
             onStatus(["status": tracker.status,
-                      "cameraAssist": UWBTracker.supportsCameraAssistance,
+                      "directionSupported": UWBTracker.supportsDirection || UWBTracker.supportsCameraAssistance,
                       "uwbSupported": UWBTracker.isSupported])
         }
     }
