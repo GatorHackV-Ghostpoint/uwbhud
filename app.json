@@ -7,7 +7,7 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "ios": {
-      "bundleIdentifier": "com.jackl.uwbhud",
+      "bundleIdentifier": "com.jacklowry.uwbhud",
       "supportsTablet": false,
       "infoPlist": {
         "NSCameraUsageDescription": "Shows nearby people on the camera view",
