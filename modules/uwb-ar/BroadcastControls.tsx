@@ -26,7 +26,7 @@ export function BroadcastControls() {
   return (
     <View style={styles.panel}>
       {!active && <>
-        <TextInput style={styles.input} value={url} onChangeText={setUrl} placeholder="HTTPS HUD WHIP URL"
+        <TextInput style={styles.input} value={url} onChangeText={setUrl} placeholder="HTTPS WHIP URL (./media/<name>/whip)"
           placeholderTextColor="#bbb" autoCapitalize="none" autoCorrect={false} keyboardType="url" accessibilityLabel="HUD WHIP URL" />
       </>}
       <Button title={active ? 'Stop Broadcast' : 'Start Broadcast'} onPress={toggle}
