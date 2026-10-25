@@ -5,6 +5,10 @@ import {
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
 import { BroadcastControls } from './modules/uwb-ar/BroadcastControls';
 
+// Broadcast to the GhostPoint server (and the shared waypoint that rides on it) is off while we debug UWB
+// pairing: with it off the app makes no server requests at all. Set to true to bring the panel back.
+const BROADCAST_ENABLED = false;
+
 // Screen margins the HUD keeps clear (top status bar, bottom panel). Inside them the native view
 // draws each peer's name tag; outside them we draw an edge arrow.
 const INSET = { top: 130, bottom: 150, side: 30 };
@@ -93,7 +97,7 @@ export default function App() {
           ))}
         </View>
       )}
-      <BroadcastControls />
+      {BROADCAST_ENABLED && <BroadcastControls />}
     </View>
   );
 }
