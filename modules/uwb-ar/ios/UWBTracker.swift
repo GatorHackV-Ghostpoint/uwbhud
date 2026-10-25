@@ -2,6 +2,7 @@ import ARKit
 import MultipeerConnectivity
 import NearbyInteraction
 import ReplayKit
+import UIKit
 
 /// One Euro filter (https://gery.casiez.net/1euro/): smooths hard while the target is still,
 /// and loosens up as it moves so the marker doesn't lag behind someone walking.
@@ -107,6 +108,8 @@ final class UWBTracker: NSObject {
     private var linkedAt: [MCPeerID: TimeInterval] = [:]
     private var droppedAt: [MCPeerID: TimeInterval] = [:]   // when the link last went down
     private var lastPrune: TimeInterval = 0
+    private var suspendedAt: [MCPeerID: TimeInterval] = [:]   // UWB sessions iOS has paused, by when
+    private var pauseRebuilds: [MCPeerID: Int] = [:]          // rebuilds in a row that iOS paused again
     private var plainSessions = Set<MCPeerID>()   // peers where iOS rejected camera assistance
 
     // Our own ARKit pose, shared with the other phones.
@@ -120,6 +123,8 @@ final class UWBTracker: NSObject {
     static let linkDelay: TimeInterval = 0.04
     /// A phone with no link, no UWB reading and no poses for this long is gone (relaunched, re-paired, or left).
     static let staleAfter: TimeInterval = 15
+    /// A UWB session still paused this long after the app is back in the foreground is rebuilt.
+    static let resumeGrace: TimeInterval = 3
     /// After this long without a UWB session failure, a peer gets a fresh set of restart attempts.
     static let restartCooldown: TimeInterval = 30
 
@@ -308,6 +313,8 @@ final class UWBTracker: NSObject {
         linkedAt[peer] = nil
         droppedAt[peer] = nil
         plainSessions.remove(peer)
+        suspendedAt[peer] = nil
+        pauseRebuilds[peer] = nil
         readings[peer] = nil
         event("Dropped \(peer.displayName): \(reason)")
     }
@@ -321,6 +328,33 @@ final class UWBTracker: NSObject {
             let heard = max(r.lastUpdate, r.theirPositionTime, droppedAt[peer] ?? linkedAt[peer] ?? 0)
             if now - heard > Self.staleAfter { forget(peer, because: "no signal for \(Int(Self.staleAfter)) s") }
         }
+        // iOS pauses UWB whenever the app isn't frontmost (consent prompts, Control Center, screen lock) and
+        // is meant to say when it may resume, but that callback doesn't always come. If we're active again
+        // and a session is still paused, rebuild it rather than leaving tracking stopped for good.
+        guard UIApplication.shared.applicationState == .active else {
+            for peer in suspendedAt.keys { suspendedAt[peer] = now }   // count the grace from when we're back
+            return
+        }
+        for (peer, since) in suspendedAt {
+            // Back off (3, 6, 12 … 30 s): if iOS pauses every new session straight away, something system-wide
+            // is blocking UWB and restarting faster only churns.
+            let tries = pauseRebuilds[peer] ?? 0
+            guard now - since > min(Self.resumeGrace * pow(2, Double(tries)), 30) else { continue }
+            suspendedAt[peer] = nil
+            guard tokens[peer] != nil else { continue }
+            pauseRebuilds[peer] = tries + 1
+            event("UWB with \(peer.displayName) stayed paused; restarting it (try \(tries + 1))")
+            rebuildSession(for: peer)
+        }
+    }
+
+    /// A fresh NI session has a new token: send it so the other phone re-runs with it, and run with theirs.
+    private func rebuildSession(for peer: MCPeerID) {
+        let old = sessions.removeValue(forKey: peer)   // detach first so the invalidate callback ignores it
+        old?.invalidate()
+        _ = makeSession(for: peer)
+        sendToken(to: peer, attempt: 1)
+        run(peer)
     }
 
     // MARK: AR fusion
@@ -457,6 +491,7 @@ extension UWBTracker: NISessionDelegate {
         guard let peer = peer(for: session), let obj = nearbyObjects.first, var r = readings[peer] else { return }
         if r.lastUpdate == 0 {
             restarts[peer] = nil
+            pauseRebuilds[peer] = nil
             event("Ranging with \(peer.displayName)")
             note("Ranging with \(peer.displayName)")
         }
@@ -532,11 +567,26 @@ extension UWBTracker: NISessionDelegate {
     }
 
     func sessionWasSuspended(_ session: NISession) {
-        note("UWB paused (app in background?)")
+        guard let peer = peer(for: session) else { return }
+        suspendedAt[peer] = CACurrentMediaTime()
+        let app = ["active", "inactive", "background"][min(UIApplication.shared.applicationState.rawValue, 2)]
+        let heat = ["nominal", "fair", "serious", "critical"][min(ProcessInfo.processInfo.thermalState.rawValue, 3)]
+        let low = ProcessInfo.processInfo.isLowPowerModeEnabled ? ", low power" : ""
+        let rec = RPScreenRecorder.shared().isRecording ? ", broadcasting" : ""
+        event("UWB with \(peer.displayName) paused by iOS [app \(app), heat \(heat)\(low)\(rec)]")
+        // Paused while we're on screen: iOS is blocking UWB itself. Seen with Bluetooth switched off in Settings
+        // (UWB needs it; the phones still link over Wi-Fi, so pairing looks fine).
+        note(UIApplication.shared.applicationState == .active
+             ? "UWB paused by iOS. Check Bluetooth is on (Settings → Bluetooth) and Airplane Mode is off"
+             : "UWB paused (app not in the foreground). Resumes when you return…")
     }
 
     func sessionSuspensionEnded(_ session: NISession) {
-        if let peer = peer(for: session) { run(peer) }
+        guard let peer = peer(for: session) else { return }
+        suspendedAt[peer] = nil
+        event("UWB with \(peer.displayName) resumed")
+        note("UWB resumed with \(peer.displayName)")
+        run(peer)
     }
 
     func session(_ session: NISession, didInvalidateWith error: Error) {
