@@ -29,6 +29,7 @@ final class UwbArView: ExpoView {
     private let arView = ARView(frame: .zero)
     private let markerRoot = AnchorEntity(world: .zero)
     private var tracker: UWBTracker?
+    private var waypointOverlay: WaypointOverlay?
     private let snapper = PersonSnapper()
     private var markers: [MCPeerID: ModelEntity] = [:]
     private let tagLayer = UIView()
@@ -70,6 +71,10 @@ final class UwbArView: ExpoView {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.isCollaborationEnabled = false
+        config.planeDetection = [.horizontal, .vertical]
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
+        }
         arView.session.run(config)
         startTracker()
         updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in self?.tick() }
@@ -87,12 +92,15 @@ final class UwbArView: ExpoView {
                            pairingCode: pairingCode.isEmpty ? nil : pairingCode)
         tracker = t
         t.start()
+        waypointOverlay = WaypointOverlay(arView: arView, tracker: t, container: tagLayer)
         snapper.onMatch = { [weak t] peer, snap, target in
             t?.addCameraFix(for: peer, point: snap.point, target: target, at: snap.time)
         }
     }
 
     private func stopTracker() {
+        waypointOverlay?.stop()
+        waypointOverlay = nil
         tracker?.stop()
         tracker = nil
         lastStatus = ""
@@ -111,6 +119,7 @@ final class UwbArView: ExpoView {
     private func tick() {
         guard let tracker, let frame = arView.session.currentFrame else { return }
         tracker.update(with: frame)
+        waypointOverlay?.tick(camera: frame.camera)
         let now = CACurrentMediaTime()
         let dt = Float(min(max(now - lastTick, 0), 0.1))   // time-based easing: same feel at any frame rate
         lastTick = now
