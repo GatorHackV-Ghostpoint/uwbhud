@@ -1,6 +1,7 @@
 import ARKit
 import MultipeerConnectivity
 import NearbyInteraction
+import ReplayKit
 
 /// One Euro filter (https://gery.casiez.net/1euro/): smooths hard while the target is still,
 /// and loosens up as it moves so the marker doesn't lag behind someone walking.
@@ -102,7 +103,10 @@ final class UWBTracker: NSObject {
     private var sessions: [MCPeerID: NISession] = [:]
     private var tokens: [MCPeerID: NIDiscoveryToken] = [:]   // their token, remembered to restart after interruptions
     private var restarts: [MCPeerID: Int] = [:]
+    private var lastRestart: [MCPeerID: TimeInterval] = [:]
     private var linkedAt: [MCPeerID: TimeInterval] = [:]
+    private var droppedAt: [MCPeerID: TimeInterval] = [:]   // when the link last went down
+    private var lastPrune: TimeInterval = 0
     private var plainSessions = Set<MCPeerID>()   // peers where iOS rejected camera assistance
 
     // Our own ARKit pose, shared with the other phones.
@@ -114,6 +118,10 @@ final class UWBTracker: NSObject {
 
     /// Rough one-way delay of the pose stream (Wi-Fi/Bluetooth peer link), used to predict their position.
     static let linkDelay: TimeInterval = 0.04
+    /// A phone with no link, no UWB reading and no poses for this long is gone (relaunched, re-paired, or left).
+    static let staleAfter: TimeInterval = 15
+    /// After this long without a UWB session failure, a peer gets a fresh set of restart attempts.
+    static let restartCooldown: TimeInterval = 30
 
     static var isSupported: Bool { NISession.deviceCapabilities.supportsPreciseDistanceMeasurement }
     static var supportsCameraAssistance: Bool { NISession.deviceCapabilities.supportsCameraAssistance }
@@ -168,7 +176,12 @@ final class UWBTracker: NSObject {
     // MARK: Handshake
 
     private func connected(_ peer: MCPeerID) {
+        // Same name, new peer ID: that phone relaunched or changed its code. The old entry is a ghost.
+        for old in readings.keys where old != peer && old.displayName == peer.displayName {
+            forget(old, because: "reconnected as a new session")
+        }
         linkedAt[peer] = CACurrentMediaTime()
+        droppedAt[peer] = nil
         note("Connected to \(peer.displayName). Preparing UWB token…")
         if sessions[peer] == nil { _ = makeSession(for: peer) }
         if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
@@ -244,6 +257,7 @@ final class UWBTracker: NSObject {
         if sessions[peer] == nil {
             // Token beat the connect callback, or our session just failed. Don't rebuild a
             // session that keeps failing: that's what made the status flip endlessly.
+            if let last = lastRestart[peer], CACurrentMediaTime() - last > Self.restartCooldown { restarts[peer] = nil }
             guard (restarts[peer] ?? 0) <= 3 else { return }
             connected(peer)
         }
@@ -270,6 +284,7 @@ final class UWBTracker: NSObject {
 
     private func disconnected(_ peer: MCPeerID) {
         linkedAt[peer] = nil
+        droppedAt[peer] = CACurrentMediaTime()
         // Keep the UWB session: once tokens are swapped, UWB keeps working without this link,
         // and tearing it down mid-setup is what killed the token before.
         if tokens[peer] == nil {
@@ -281,6 +296,31 @@ final class UWBTracker: NSObject {
 
     private func peer(for session: NISession) -> MCPeerID? {
         sessions.first(where: { $0.value === session })?.key
+    }
+
+    /// Removes everything we hold for a phone: its UWB session, token, pose alignment and on-screen marker.
+    private func forget(_ peer: MCPeerID, because reason: String) {
+        let s = sessions.removeValue(forKey: peer)   // detach first so the invalidate callback ignores it
+        s?.invalidate()
+        tokens[peer] = nil
+        restarts[peer] = nil
+        lastRestart[peer] = nil
+        linkedAt[peer] = nil
+        droppedAt[peer] = nil
+        plainSessions.remove(peer)
+        readings[peer] = nil
+        event("Dropped \(peer.displayName): \(reason)")
+    }
+
+    /// Once a second: forget phones that have gone quiet. UWB is deliberately kept through link drops, so a
+    /// phone is only dropped when the link, UWB and its pose stream have all been silent for `staleAfter`.
+    private func pruneStale(at now: TimeInterval) {
+        guard now - lastPrune >= 1 else { return }
+        lastPrune = now
+        for (peer, r) in readings where !link.isConnected(peer) {
+            let heard = max(r.lastUpdate, r.theirPositionTime, droppedAt[peer] ?? linkedAt[peer] ?? 0)
+            if now - heard > Self.staleAfter { forget(peer, because: "no signal for \(Int(Self.staleAfter)) s") }
+        }
     }
 
     // MARK: AR fusion
@@ -311,7 +351,12 @@ final class UWBTracker: NSObject {
         myPosition = normal ? pos : nil
         myPositionTime = now
 
-        guard now - lastStateSent >= 1.0 / 65 else { return }   // ARKit runs at 60 fps; cap on 120 Hz screens
+        pruneStale(at: now)
+
+        // ARKit runs at 60 fps; cap on 120 Hz screens. While broadcasting, the video upload shares the Wi-Fi
+        // radio with the peer link, so halve the pose stream to leave the link room.
+        let interval = RPScreenRecorder.shared().isRecording ? 1.0 / 30 : 1.0 / 65
+        guard now - lastStateSent >= interval else { return }
         lastStateSent = now
         let clock = UInt32(truncatingIfNeeded: Int64(frame.timestamp * 1000))
         for (peer, r) in readings {
@@ -411,6 +456,7 @@ extension UWBTracker: NISessionDelegate {
     func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
         guard let peer = peer(for: session), let obj = nearbyObjects.first, var r = readings[peer] else { return }
         if r.lastUpdate == 0 {
+            restarts[peer] = nil
             event("Ranging with \(peer.displayName)")
             note("Ranging with \(peer.displayName)")
         }
@@ -478,7 +524,10 @@ extension UWBTracker: NISessionDelegate {
             readings[peer]?.worldPosition = nil   // out of range / blocked; keep session for when they return
             note("UWB timed out with \(peer.displayName) (out of range or blocked?)")
         } else if reason == .peerEnded {
-            note("\(peer.displayName) stopped UWB")
+            // Link still up: they're restarting and their new token will re-run this session. Link down too:
+            // they re-paired or quit, so drop them now instead of leaving a ghost.
+            if link.isConnected(peer) { note("\(peer.displayName) stopped UWB") }
+            else { forget(peer, because: "stopped UWB") }
         }
     }
 
@@ -503,6 +552,9 @@ extension UWBTracker: NISessionDelegate {
             note("UWB error \(code): \(error.localizedDescription) [\(arInfo)]")
         }
         sessions[peer] = nil
+        let now = CACurrentMediaTime()
+        if let last = lastRestart[peer], now - last > Self.restartCooldown { restarts[peer] = nil }
+        lastRestart[peer] = now
         let n = (restarts[peer] ?? 0) + 1
         restarts[peer] = n
         guard n <= 3, link.isConnected(peer) else { return }   // don't loop forever

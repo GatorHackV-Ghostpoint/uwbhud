@@ -23,6 +23,14 @@ final class UwbArView: ExpoView {
             startTracker()
         }
     }
+    /// Changing this tears down every connection and UWB session and pairs again from scratch, keeping the code.
+    var resetKey = 0.0 {
+        didSet {
+            guard resetKey != oldValue, tracker != nil else { return }
+            stopTracker()
+            startTracker()
+        }
+    }
     /// Screen margins kept clear for the JS HUD; a peer outside them gets an edge arrow instead of a tag.
     var tagInsets = (top: 130.0, bottom: 150.0, side: 30.0)
 
