@@ -3,11 +3,8 @@ import {
   Linking, Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, useWindowDimensions, View,
 } from 'react-native';
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
-import { BroadcastControls } from './modules/uwb-ar/BroadcastControls';
-
-// Broadcast to the GhostPoint server (and the shared waypoint that rides on it) is off while we debug UWB
-// pairing: with it off the app makes no server requests at all. Set to true to bring the panel back.
-const BROADCAST_ENABLED = false;
+import { BroadcastPanel, SERVER, useBroadcast, type Broadcast } from './modules/uwb-ar/BroadcastControls';
+import { WaypointControls } from './modules/uwb-ar/WaypointControls';
 
 // Screen margins the HUD keeps clear (top status bar, bottom panel). Inside them the native view
 // draws each peer's name tag; outside them we draw an edge arrow.
@@ -24,6 +21,7 @@ export default function App() {
   const [bluetoothDismissed, setBluetoothDismissed] = useState(false);
   const [name] = useState(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase());
   const supported = useMemo(() => isUwbSupported(), []);
+  const broadcast = useBroadcast();
 
   if (!supported) {
     return (
@@ -38,6 +36,8 @@ export default function App() {
   const waiting = peers.filter((p) => !p.hasPosition || p.stale);
   const bluetooth = status?.bluetooth ?? 'unknown';
   const bluetoothProblem = bluetooth === 'off' || bluetooth === 'unauthorized';
+  const linked = peers.length > 0;   // linked to at least one phone: broadcasting is allowed
+  const live = broadcast.status.state === 'live';
 
   return (
     <View style={styles.fill}>
@@ -81,6 +81,7 @@ export default function App() {
         >
           <Text style={styles.pairIcon}>⇄</Text>
           {pairingCode !== '' && <Text style={styles.pairBadge}>{pairingCode}</Text>}
+          {live && <View style={styles.liveDot} accessibilityLabel="Broadcasting" />}
         </Pressable>
       </View>
 
@@ -95,50 +96,62 @@ export default function App() {
         visible={menuOpen}
         code={pairingCode}
         status={status}
+        linked={linked}
+        broadcast={broadcast}
         onCode={setPairingCode}
         onReset={() => setResetKey((k) => k + 1)}
         onClose={() => setMenuOpen(false)}
       />
 
-      {waiting.length > 0 && (
-        <View style={[styles.card, styles.bottom]}>
-          {waiting.map((p) =>
-            p.uwbOffHere || p.uwbOffThere ? (
-              <Text key={p.id} style={[styles.cardText, styles.noUwbText]}>
-                {p.name}: no UWB ({p.uwbOffHere ? 'Bluetooth is off on this phone' : 'Bluetooth is off on their phone'}).
-                Position unavailable
-              </Text>
-            ) : (
-              <Text key={p.id} style={styles.cardText}>
-                {p.name}: {formatDistance(p.distance)}
-                {p.stale
-                  ? ' (signal lost)'
-                  : p.distance == null
-                    ? '. Waiting for UWB…'
-                    : `. ${p.guidance ?? directionHint(p)}`}
-              </Text>
-            ),
-          )}
-        </View>
-      )}
-      {BROADCAST_ENABLED && <BroadcastControls />}
+      <View style={styles.bottomStack} pointerEvents="box-none">
+        {waiting.length > 0 && (
+          <View style={styles.card}>
+            {waiting.map((p) =>
+              p.uwbOffHere || p.uwbOffThere ? (
+                <Text key={p.id} style={[styles.cardText, styles.noUwbText]}>
+                  {p.name}: no UWB ({p.uwbOffHere ? 'Bluetooth is off on this phone' : 'Bluetooth is off on their phone'}).
+                  Position unavailable
+                </Text>
+              ) : (
+                <Text key={p.id} style={styles.cardText}>
+                  {p.name}: {formatDistance(p.distance)}
+                  {p.stale
+                    ? ' (signal lost)'
+                    : p.distance == null
+                      ? '. Waiting for UWB…'
+                      : `. ${p.guidance ?? directionHint(p)}`}
+                </Text>
+              ),
+            )}
+          </View>
+        )}
+        {/* Placing a waypoint means tapping the camera view, so these stay on screen rather than in the sheet. */}
+        {broadcast.device && <WaypointControls server={SERVER} device={broadcast.device} />}
+      </View>
     </View>
   );
 }
 
 /**
- * Pairing sheet. Automatic connects to any nearby phone running the app; with a code, only phones
- * using the same code connect, so you get exactly the phone you mean, even in a room full of them.
+ * Link sheet with two modes. Pairing: automatic connects to any nearby phone running the app; with a code, only
+ * phones using the same code connect, so you get exactly the phone you mean, even in a room full of them.
+ * Broadcast: share this screen with the dashboard. It stays grayed out until a phone is linked.
  */
-function PairingMenu({ visible, code, status, onCode, onReset, onClose }: {
+function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset, onClose }: {
   visible: boolean;
   code: string;
   status: UwbStatus | null;
+  linked: boolean;
+  broadcast: Broadcast;
   onCode: (code: string) => void;
   onReset: () => void;
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState('');
+  const [tab, setTab] = useState<'pairing' | 'broadcast'>('pairing');
+  // A running broadcast can always be reached (to stop it), even if the link has since dropped.
+  const canBroadcast = linked || broadcast.active;
+  const mode = tab === 'broadcast' && canBroadcast ? 'broadcast' : 'pairing';
   const join = () => {
     if (draft.length >= 4) {
       onCode(draft);
@@ -151,68 +164,91 @@ function PairingMenu({ visible, code, status, onCode, onReset, onClose }: {
       <View style={styles.sheetBackdrop}>
         <View style={styles.sheet}>
           <View style={styles.sheetHeader}>
-            <Text style={styles.sheetTitle}>Pairing</Text>
+            <Text style={styles.sheetTitle}>{mode === 'pairing' ? 'Pairing' : 'Broadcast'}</Text>
             <Pressable accessibilityRole="button" accessibilityLabel="Close" onPress={onClose} hitSlop={12}>
               <Text style={styles.sheetClose}>✕</Text>
             </Pressable>
           </View>
 
-          {code ? (
-            <>
-              <Text style={styles.sheetLabel}>Pairing code</Text>
-              <Text style={styles.code}>{code}</Text>
-              <Text style={styles.sheetHint}>Enter this code on the other phone. Only phones using it will connect.</Text>
-            </>
-          ) : (
-            <Text style={styles.sheetHint}>Automatic: connects to any nearby phone running UWBHud.</Text>
-          )}
-
-          <View style={styles.row}>
+          <View style={styles.tabs} accessibilityRole="tablist">
             <Pressable
-              accessibilityRole="button"
-              style={styles.button}
-              onPress={() => onCode(String(Math.floor(1000 + Math.random() * 9000)))}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: mode === 'pairing' }}
+              style={[styles.tab, mode === 'pairing' && styles.tabSelected]}
+              onPress={() => setTab('pairing')}
             >
-              <Text style={styles.buttonText}>{code ? 'New code' : 'Create code'}</Text>
+              <Text style={styles.tabText}>Pairing</Text>
             </Pressable>
-            {code !== '' && (
-              <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet]} onPress={() => onCode('')}>
-                <Text style={styles.buttonText}>Use automatic</Text>
-              </Pressable>
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{ selected: mode === 'broadcast', disabled: !canBroadcast }}
+              disabled={!canBroadcast}
+              style={[styles.tab, mode === 'broadcast' && styles.tabSelected, !canBroadcast && styles.tabDisabled]}
+              onPress={() => setTab('broadcast')}
+            >
+              <Text style={styles.tabText}>Broadcast{broadcast.status.state === 'live' ? '  ●' : ''}</Text>
+            </Pressable>
+          </View>
+          {!canBroadcast && <Text style={styles.tabHint}>Broadcast unlocks once another phone is paired.</Text>}
+
+          {mode === 'broadcast' ? <BroadcastPanel broadcast={broadcast} /> : <>
+            {code ? (
+              <>
+                <Text style={styles.sheetLabel}>Pairing code</Text>
+                <Text style={styles.code}>{code}</Text>
+                <Text style={styles.sheetHint}>Enter this code on the other phone. Only phones using it will connect.</Text>
+              </>
+            ) : (
+              <Text style={styles.sheetHint}>Automatic: connects to any nearby phone running UWBHud.</Text>
             )}
-          </View>
 
-          <View style={styles.row}>
-            <TextInput
-              value={draft}
-              onChangeText={(t) => setDraft(t.replace(/\D/g, '').slice(0, 6))}
-              onSubmitEditing={join}
-              placeholder="Enter code"
-              placeholderTextColor="#888"
-              keyboardType="number-pad"
-              returnKeyType="done"
-              style={styles.input}
-            />
-            <Pressable
-              accessibilityRole="button"
-              disabled={draft.length < 4}
-              style={[styles.button, draft.length < 4 && styles.buttonDisabled]}
-              onPress={join}
-            >
-              <Text style={styles.buttonText}>Join</Text>
+            <View style={styles.row}>
+              <Pressable
+                accessibilityRole="button"
+                style={styles.button}
+                onPress={() => onCode(String(Math.floor(1000 + Math.random() * 9000)))}
+              >
+                <Text style={styles.buttonText}>{code ? 'New code' : 'Create code'}</Text>
+              </Pressable>
+              {code !== '' && (
+                <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet]} onPress={() => onCode('')}>
+                  <Text style={styles.buttonText}>Use automatic</Text>
+                </Pressable>
+              )}
+            </View>
+
+            <View style={styles.row}>
+              <TextInput
+                value={draft}
+                onChangeText={(t) => setDraft(t.replace(/\D/g, '').slice(0, 6))}
+                onSubmitEditing={join}
+                placeholder="Enter code"
+                placeholderTextColor="#888"
+                keyboardType="number-pad"
+                returnKeyType="done"
+                style={styles.input}
+              />
+              <Pressable
+                accessibilityRole="button"
+                disabled={draft.length < 4}
+                style={[styles.button, draft.length < 4 && styles.buttonDisabled]}
+                onPress={join}
+              >
+                <Text style={styles.buttonText}>Join</Text>
+              </Pressable>
+            </View>
+
+            <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet, styles.resetButton]} onPress={onReset}>
+              <Text style={styles.buttonText}>Reset pairing</Text>
             </Pressable>
-          </View>
 
-          <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet, styles.resetButton]} onPress={onReset}>
-            <Text style={styles.buttonText}>Reset pairing</Text>
-          </Pressable>
-
-          <Text style={styles.sheetLabel}>{status?.status ?? 'Starting…'}</Text>
-          <ScrollView style={styles.timeline}>
-            {(status?.timeline ?? []).map((line, i) => (
-              <Text key={i} style={styles.timelineText}>{line}</Text>
-            ))}
-          </ScrollView>
+            <Text style={styles.sheetLabel}>{status?.status ?? 'Starting…'}</Text>
+            <ScrollView style={styles.timeline}>
+              {(status?.timeline ?? []).map((line, i) => (
+                <Text key={i} style={styles.timelineText}>{line}</Text>
+              ))}
+            </ScrollView>
+          </>}
         </View>
       </View>
     </Modal>
@@ -295,10 +331,8 @@ const styles = StyleSheet.create({
   center: { alignItems: 'center', justifyContent: 'center', padding: 24 },
   big: { color: 'white', fontSize: 20, fontWeight: '700', textAlign: 'center' },
   small: { color: '#ccc', fontSize: 15, marginTop: 8 },
-  card: {
-    position: 'absolute', left: 12, right: 12,
-    backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12, padding: 10,
-  },
+  card: { backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12, padding: 10 },
+  bottomStack: { position: 'absolute', left: 12, right: 12, bottom: 40, gap: 8 },
   topBar: {
     position: 'absolute', top: 56, left: 12, right: 12,
     flexDirection: 'row', alignItems: 'stretch', gap: 8,
@@ -307,7 +341,6 @@ const styles = StyleSheet.create({
     flex: 1, minHeight: 44, justifyContent: 'center',
     backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12, padding: 10,
   },
-  bottom: { bottom: 40 },
   cardText: { color: 'white', fontSize: 14, fontWeight: '600' },
   warn: { color: '#ffcc00', fontSize: 13, marginTop: 4 },
   edge: {
@@ -328,6 +361,13 @@ const styles = StyleSheet.create({
   },
   pairIcon: { color: 'white', fontSize: 22, fontWeight: '700' },
   pairBadge: { color: '#34c759', fontSize: 10, fontWeight: '700' },
+  liveDot: { position: 'absolute', top: 6, right: 6, width: 8, height: 8, borderRadius: 4, backgroundColor: '#ff3b30' },
+  tabs: { flexDirection: 'row', backgroundColor: '#2c2c2e', borderRadius: 10, padding: 3, gap: 3 },
+  tab: { flex: 1, minHeight: 36, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
+  tabSelected: { backgroundColor: '#48484a' },
+  tabDisabled: { opacity: 0.35 },
+  tabText: { color: 'white', fontSize: 14, fontWeight: '700' },
+  tabHint: { color: '#8e8e93', fontSize: 12, marginTop: 6 },
   sheetBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.35)' },
   sheet: {
     backgroundColor: '#1c1c1e', borderTopLeftRadius: 20, borderTopRightRadius: 20,
