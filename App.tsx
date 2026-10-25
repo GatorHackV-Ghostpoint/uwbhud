@@ -10,7 +10,7 @@ const TAG_INSETS: [number, number, number] = [INSET.top, INSET.bottom, INSET.sid
 export default function App() {
   const [peers, setPeers] = useState<UwbPeer[]>([]);
   const [status, setStatus] = useState<UwbStatus | null>(null);
-  const name = useMemo(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase(), []);
+  const [name] = useState(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase());
   const supported = useMemo(() => isUwbSupported(), []);
 
   if (!supported) {
