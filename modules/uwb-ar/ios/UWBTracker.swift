@@ -93,12 +93,16 @@ private func median(_ points: [SIMD3<Float>]) -> SIMD3<Float> {
 final class UWBTracker: NSObject {
     private(set) var readings: [MCPeerID: PeerReading] = [:]
     private(set) var status = "Starting…"
+    /// Timestamped pairing steps ("2.4s  Linked with Phone-AB"), newest last, for the pairing menu.
+    private(set) var timeline: [String] = []
+    private let startTime = CACurrentMediaTime()
 
     private let arSession: ARSession
     private let link: PeerLink
     private var sessions: [MCPeerID: NISession] = [:]
     private var tokens: [MCPeerID: NIDiscoveryToken] = [:]   // their token, remembered to restart after interruptions
     private var restarts: [MCPeerID: Int] = [:]
+    private var linkedAt: [MCPeerID: TimeInterval] = [:]
     private var plainSessions = Set<MCPeerID>()   // peers where iOS rejected camera assistance
 
     // Our own ARKit pose, shared with the other phones.
@@ -122,15 +126,24 @@ final class UWBTracker: NSObject {
         Self.supportsCameraAssistance && !Self.supportsDirection && !plainSessions.contains(peer)
     }
 
-    init(arSession: ARSession, displayName: String) {
+    /// `pairingCode`: connect only to phones using the same code; nil connects to any phone running the app.
+    init(arSession: ARSession, displayName: String, pairingCode: String?) {
         self.arSession = arSession
-        self.link = PeerLink(displayName: displayName)
+        self.link = PeerLink(displayName: displayName, code: pairingCode)
         super.init()
         link.onConnected = { [weak self] in self?.connected($0) }
         link.onDisconnected = { [weak self] in self?.disconnected($0) }
         link.onToken = { [weak self] in self?.received(token: $1, from: $0) }
         link.onState = { [weak self] in self?.received(state: $1, from: $0) }
         link.onLog = { [weak self] in self?.note($0) }
+        link.onEvent = { [weak self] in self?.event($0) }
+    }
+
+    /// Adds a step to the pairing timeline (and the Mac's Console app).
+    private func event(_ text: String) {
+        timeline.append(String(format: "%5.1fs  %@", CACurrentMediaTime() - startTime, text))
+        if timeline.count > 40 { timeline.removeFirst(timeline.count - 40) }
+        NSLog("[UWBHud] %@", text)
     }
 
     /// Show a step on screen and in the Mac's Console app (search "[UWBHud]").
@@ -142,7 +155,8 @@ final class UWBTracker: NSObject {
     func start() {
         guard Self.isSupported else { note("This iPhone has no UWB chip"); return }
         link.start()
-        note("Looking for the other phone…")
+        event(link.code.map { "Looking for phones using code \($0)" } ?? "Looking for nearby phones")
+        note(link.code.map { "Looking for the phone using code \($0)…" } ?? "Looking for the other phone…")
     }
 
     func stop() {
@@ -154,6 +168,7 @@ final class UWBTracker: NSObject {
     // MARK: Handshake
 
     private func connected(_ peer: MCPeerID) {
+        linkedAt[peer] = CACurrentMediaTime()
         note("Connected to \(peer.displayName). Preparing UWB token…")
         if sessions[peer] == nil { _ = makeSession(for: peer) }
         if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
@@ -215,6 +230,7 @@ final class UWBTracker: NSObject {
         if let err = link.send(token: token, to: peer) {
             note("Token send failed (try \(attempt)): \(err)")
         } else if tokens[peer] == nil {
+            event("Sent UWB token (try \(attempt))")
             note("Sent UWB token to \(peer.displayName) (try \(attempt)). Waiting for theirs…")
         }
         guard tokens[peer] == nil, attempt < 10 else { return }
@@ -238,6 +254,7 @@ final class UWBTracker: NSObject {
             return
         }
         tokens[peer] = token
+        event("Got UWB token from \(peer.displayName)")
         note("Got token from \(peer.displayName). Starting UWB…")
         run(peer)
         sendToken(to: peer, attempt: 10)   // make sure they have ours too
@@ -252,6 +269,7 @@ final class UWBTracker: NSObject {
     }
 
     private func disconnected(_ peer: MCPeerID) {
+        linkedAt[peer] = nil
         // Keep the UWB session: once tokens are swapped, UWB keeps working without this link,
         // and tearing it down mid-setup is what killed the token before.
         if tokens[peer] == nil {
@@ -297,6 +315,10 @@ final class UWBTracker: NSObject {
         lastStateSent = now
         let clock = UInt32(truncatingIfNeeded: Int64(frame.timestamp * 1000))
         for (peer, r) in readings {
+            // Not until the UWB tokens are swapped and the link has held for a second: streaming 60 poses/sec
+            // into a link that's still settling (often moving from Bluetooth to Wi-Fi) delays the token
+            // behind it or drops the connection, which is what slowed pairing down.
+            guard tokens[peer] != nil, let since = linkedAt[peer], now - since > 1 else { continue }
             let fresh = r.measurement != nil && now - r.positionTime < 0.5
             link.send(state: PeerState(time: clock, epoch: epoch, position: myPosition, measurementSeq: r.measurementSeq,
                                        measurement: fresh ? r.measurement : nil), to: peer)
@@ -372,7 +394,10 @@ final class UWBTracker: NSObject {
 extension UWBTracker: NISessionDelegate {
     func session(_ session: NISession, didUpdate nearbyObjects: [NINearbyObject]) {
         guard let peer = peer(for: session), let obj = nearbyObjects.first, var r = readings[peer] else { return }
-        if r.lastUpdate == 0 { note("Ranging with \(peer.displayName)") }
+        if r.lastUpdate == 0 {
+            event("Ranging with \(peer.displayName)")
+            note("Ranging with \(peer.displayName)")
+        }
         let now = CACurrentMediaTime()
         if let d = obj.distance { r.distance = r.distanceFilter.filter(SIMD3(repeating: d), at: now).x }
         var p: SIMD3<Float>?

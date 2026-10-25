@@ -14,6 +14,15 @@ final class UwbArView: ExpoView {
     let onPeers = EventDispatcher()
     let onStatus = EventDispatcher()
     var displayName = "Phone"
+    /// Manual pairing: only connect to phones using this code. Empty = any nearby phone running the app.
+    /// Changing it re-pairs from scratch (the camera keeps running).
+    var pairingCode = "" {
+        didSet {
+            guard pairingCode != oldValue, tracker != nil else { return }
+            stopTracker()
+            startTracker()
+        }
+    }
     /// Screen margins kept clear for the JS HUD; a peer outside them gets an edge arrow instead of a tag.
     var tagInsets = (top: 130.0, bottom: 150.0, side: 30.0)
 
@@ -30,6 +39,7 @@ final class UwbArView: ExpoView {
     private var updateSub: Cancellable?
     private var lastEmit: TimeInterval = 0
     private var lastStatus = ""
+    private var lastTimeline = ""
 
     required init(appContext: AppContext? = nil) {
         super.init(appContext: appContext)
@@ -61,22 +71,32 @@ final class UwbArView: ExpoView {
         config.worldAlignment = .gravity
         config.isCollaborationEnabled = false
         arView.session.run(config)
-
-        let t = UWBTracker(arSession: arView.session, displayName: displayName)
-        tracker = t
-        t.start()
-        snapper.onMatch = { [weak t] peer, snap, target in
-            t?.addCameraFix(for: peer, point: snap.point, target: target, at: snap.time)
-        }
+        startTracker()
         updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in self?.tick() }
     }
 
     private func stop() {
         updateSub?.cancel()
         updateSub = nil
+        stopTracker()
+        arView.session.pause()
+    }
+
+    private func startTracker() {
+        let t = UWBTracker(arSession: arView.session, displayName: displayName,
+                           pairingCode: pairingCode.isEmpty ? nil : pairingCode)
+        tracker = t
+        t.start()
+        snapper.onMatch = { [weak t] peer, snap, target in
+            t?.addCameraFix(for: peer, point: snap.point, target: target, at: snap.time)
+        }
+    }
+
+    private func stopTracker() {
         tracker?.stop()
         tracker = nil
-        arView.session.pause()
+        lastStatus = ""
+        lastTimeline = ""
         markers.values.forEach { $0.removeFromParent() }
         markers.removeAll()
         tags.values.forEach { $0.removeFromSuperview() }
@@ -181,9 +201,11 @@ final class UwbArView: ExpoView {
             lastEmit = now
             onPeers(["peers": payload])
         }
-        if tracker.status != lastStatus {
+        let timeline = tracker.timeline.last ?? ""
+        if tracker.status != lastStatus || timeline != lastTimeline {
             lastStatus = tracker.status
-            onStatus(["status": tracker.status,
+            lastTimeline = timeline
+            onStatus(["status": tracker.status, "timeline": tracker.timeline, "pairingCode": pairingCode,
                       "directionSupported": UWBTracker.supportsDirection || UWBTracker.supportsCameraAssistance,
                       "uwbSupported": UWBTracker.isSupported])
         }

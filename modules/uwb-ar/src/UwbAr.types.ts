@@ -39,10 +39,16 @@ export type UwbStatus = {
   /** This iPhone can find direction (UWB alone or with camera assistance), not just distance. */
   directionSupported: boolean;
   uwbSupported: boolean;
+  /** Pairing steps with timestamps since pairing started, e.g. "  2.4s  Linked with Phone-AB". */
+  timeline: string[];
+  /** The code in use; empty = automatic pairing. */
+  pairingCode: string;
 };
 
 export type UwbArViewProps = ViewProps & {
   displayName?: string;
+  /** Only connect to phones using the same code. Empty or omitted = any nearby phone running the app. */
+  pairingCode?: string;
   /** [top, bottom, side] margins kept clear for the HUD. Peers outside them get an edge arrow. */
   tagInsets?: [number, number, number];
   onPeers?: (event: { nativeEvent: { peers: UwbPeer[] } }) => void;
