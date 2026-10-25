@@ -40,6 +40,7 @@ final class UwbArView: ExpoView {
     private var waypointOverlay: WaypointOverlay?
     private let snapper = PersonSnapper()
     private var markers: [MCPeerID: ModelEntity] = [:]
+    private var markerApproximate: [MCPeerID: Bool] = [:]   // marker currently showing the yellow material
     private let tagLayer = UIView()
     private var tags: [MCPeerID: PeerTagView] = [:]
     private var smoothed: [MCPeerID: SIMD3<Float>] = [:]
@@ -49,6 +50,7 @@ final class UwbArView: ExpoView {
     private var lastEmit: TimeInterval = 0
     private var lastStatus = ""
     private var lastTimeline = ""
+    private var lastBluetooth = ""
 
     required init(appContext: AppContext? = nil) {
         super.init(appContext: appContext)
@@ -147,6 +149,12 @@ final class UwbArView: ExpoView {
                                        "hasPosition": false, "inFront": false, "onScreen": false, "cameraAssist": r.cameraAssist, "assistActive": r.assistActive,
                                        "fused": fix?.fused ?? false, "estimated": fix?.estimated ?? false, "snapped": false,
                                        "x": 0, "y": 0, "dirX": 0, "dirY": 0]
+            // No UWB between us (Bluetooth off on either phone). The blip can still come from an alignment UWB made
+            // earlier, kept alive by their AR poses and the camera; it's only shown green while the camera has them.
+            item["uwbOffHere"] = tracker.uwbBlocked
+            item["uwbOffThere"] = r.theirUwbOff
+            let noUwb = tracker.uwbBlocked || r.theirUwbOff
+            item["approximate"] = false
             let distance = fix?.distance ?? r.distance
             if let d = distance { item["distance"] = Double(d) }
             if let g = r.guidance { item["guidance"] = g }
@@ -175,6 +183,12 @@ final class UwbArView: ExpoView {
                 let marker = markers[peer] ?? makeMarker(peer)
                 marker.position = p   // exactly at the measured point; the tag sits just above it
                 marker.isEnabled = true
+                let approximate = noUwb && !snapped
+                if markerApproximate[peer] != approximate {
+                    markerApproximate[peer] = approximate
+                    marker.model?.materials = [Self.markerMaterial(approximate: approximate)]
+                }
+                item["approximate"] = approximate
 
                 let cam = viewMatrix * SIMD4(p, 1)   // camera space: -Z is in front
                 let inFront = cam.z < 0
@@ -197,13 +211,14 @@ final class UwbArView: ExpoView {
                 markers[peer]?.isEnabled = false
             }
             updateTag(peer, name: r.name, distance: distance, fused: fix?.fused ?? false,
-                      estimated: fix?.estimated ?? false, snapped: snapped, at: tagPoint)
+                      estimated: fix?.estimated ?? false, snapped: snapped, noUwb: noUwb, at: tagPoint)
             payload.append(item)
         }
 
         for (peer, m) in markers where !seen.contains(peer) {
             m.removeFromParent()
             markers[peer] = nil
+            markerApproximate[peer] = nil
             smoothed[peer] = nil
             snapOffset[peer] = nil
         }
@@ -219,10 +234,12 @@ final class UwbArView: ExpoView {
             onPeers(["peers": payload])
         }
         let timeline = tracker.timeline.last ?? ""
-        if tracker.status != lastStatus || timeline != lastTimeline {
+        if tracker.status != lastStatus || timeline != lastTimeline || tracker.bluetooth != lastBluetooth {
             lastStatus = tracker.status
             lastTimeline = timeline
+            lastBluetooth = tracker.bluetooth
             onStatus(["status": tracker.status, "timeline": tracker.timeline, "pairingCode": pairingCode,
+                      "bluetooth": tracker.bluetooth,
                       "directionSupported": UWBTracker.supportsDirection || UWBTracker.supportsCameraAssistance,
                       "uwbSupported": UWBTracker.isSupported])
         }
@@ -230,7 +247,7 @@ final class UwbArView: ExpoView {
 
     /// Shows the peer's tag with its bottom edge just above `point` (the sphere), or hides it.
     private func updateTag(_ peer: MCPeerID, name: String, distance: Float?, fused: Bool, estimated: Bool,
-                           snapped: Bool, at point: CGPoint?) {
+                           snapped: Bool, noUwb: Bool, at point: CGPoint?) {
         guard let point else {
             tags[peer]?.isHidden = true
             return
@@ -244,29 +261,39 @@ final class UwbArView: ExpoView {
             tags[peer] = tag
         }
         tag.isHidden = false
-        tag.setDistance(distance, fused: fused, estimated: estimated, snapped: snapped)
-        tag.alpha = estimated ? 0.55 : 1
+        tag.setDistance(distance, fused: fused, estimated: estimated, snapped: snapped, noUwb: noUwb)
+        tag.setApproximate(noUwb && !snapped)
+        tag.alpha = estimated && !noUwb ? 0.55 : 1   // the yellow tag already says it's approximate
         tag.center = CGPoint(x: point.x, y: point.y - 14 - tag.bounds.height / 2)
     }
 
     private func makeMarker(_ peer: MCPeerID) -> ModelEntity {
         let m = ModelEntity(mesh: .generateSphere(radius: 0.04),
-                            materials: [SimpleMaterial(color: .systemGreen, isMetallic: false)])
+                            materials: [Self.markerMaterial(approximate: false)])
         markerRoot.addChild(m)
         markers[peer] = m
+        markerApproximate[peer] = false
         return m
+    }
+
+    /// Green when UWB or the camera places the peer; yellow when neither does (no UWB, camera hasn't got them).
+    private static func markerMaterial(approximate: Bool) -> SimpleMaterial {
+        SimpleMaterial(color: approximate ? .systemYellow : .systemGreen, isMetallic: false)
     }
 }
 
-/// Green name + distance pill, matching the JS HUD's style.
+/// Name + distance pill, matching the JS HUD's style: green, or yellow when the position is approximate.
 private final class PeerTagView: UIView {
+    private static let green = UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 0.85)
+    private static let yellow = UIColor(red: 1, green: 204 / 255, blue: 0, alpha: 0.9)
     private let nameLabel = UILabel()
     private let distanceLabel = UILabel()
+    private var approximate = false
 
     init(name: String) {
         super.init(frame: CGRect(x: 0, y: 0, width: 170, height: 48))
         isUserInteractionEnabled = false
-        backgroundColor = UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 0.85)
+        backgroundColor = Self.green
         layer.cornerRadius = 12
         nameLabel.font = .systemFont(ofSize: 15, weight: .bold)
         distanceLabel.font = .systemFont(ofSize: 13)
@@ -287,13 +314,22 @@ private final class PeerTagView: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// Yellow with dark text (white doesn't read on yellow) while the position is approximate.
+    func setApproximate(_ on: Bool) {
+        guard on != approximate else { return }
+        approximate = on
+        backgroundColor = on ? Self.yellow : Self.green
+        for label in [nameLabel, distanceLabel] { label.textColor = on ? .black : .white }
+    }
+
     /// "~" while UWB isn't confirming the position; "· AR" when it comes from their ARKit tracking;
-    /// "· CAM" while it's snapped to the person on camera.
-    func setDistance(_ meters: Float?, fused: Bool, estimated: Bool, snapped: Bool) {
+    /// "· CAM" while it's snapped to the person on camera; "· NO UWB" while Bluetooth is off on either phone.
+    func setDistance(_ meters: Float?, fused: Bool, estimated: Bool, snapped: Bool, noUwb: Bool) {
         // Same format as the JS HUD's formatDistance.
         var text = meters.map { $0 < 10 ? String(format: "%.2f m", $0) : String(format: "%.1f m", $0) } ?? "—"
-        if estimated { text = "~" + text }
-        if fused { text += " · AR" }
+        if estimated || noUwb { text = "~" + text }
+        if noUwb { text += " · NO UWB" }
+        else if fused { text += " · AR" }
         if snapped { text += " · CAM" }
         if distanceLabel.text != text { distanceLabel.text = text }
     }

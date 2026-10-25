@@ -59,6 +59,7 @@ final class PeerLink: NSObject {
     var onDisconnected: ((MCPeerID) -> Void)?
     var onToken: ((MCPeerID, NIDiscoveryToken) -> Void)?
     var onState: ((MCPeerID, PeerState) -> Void)?
+    var onUwbAvailable: ((MCPeerID, Bool) -> Void)?   // the other phone can (or can no longer) run UWB
     var onLog: ((String) -> Void)?     // shown as the status line
     var onEvent: ((String) -> Void)?   // pairing timeline only
 
@@ -70,7 +71,7 @@ final class PeerLink: NSObject {
     static let connectTimeout: TimeInterval = 15
 
     /// First byte of every message. Builds before this sent a bare archived token, which starts with "b".
-    private enum Kind: UInt8 { case token = 1, state = 2 }
+    private enum Kind: UInt8 { case token = 1, state = 2, uwb = 3 }
 
     private struct Found {
         var rank: String
@@ -140,6 +141,13 @@ final class PeerLink: NSObject {
         var data = Data([Kind.state.rawValue])
         data.append(state.encoded())
         try? session.send(data, toPeers: [peer], with: .unreliable)
+    }
+
+    /// Tells a phone whether we can run UWB right now (we can't with Bluetooth off), so it can say so instead
+    /// of waiting for readings that will never come.
+    func send(uwbAvailable: Bool, to peer: MCPeerID) {
+        guard session.connectedPeers.contains(peer) else { return }
+        try? session.send(Data([Kind.uwb.rawValue, uwbAvailable ? 1 : 0]), toPeers: [peer], with: .reliable)
     }
 
     func isConnected(_ peer: MCPeerID) -> Bool { session.connectedPeers.contains(peer) }
@@ -253,6 +261,11 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
         if kind == .state {
             guard let state = PeerState(body) else { return }
             DispatchQueue.main.async { self.onState?(peerID, state) }
+            return
+        }
+        if kind == .uwb {
+            guard let flag = body.first else { return }
+            DispatchQueue.main.async { self.onUwbAvailable?(peerID, flag != 0) }
             return
         }
         let token = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: body)

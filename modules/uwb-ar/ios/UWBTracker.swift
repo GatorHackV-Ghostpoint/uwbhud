@@ -1,4 +1,5 @@
 import ARKit
+import CoreBluetooth
 import MultipeerConnectivity
 import NearbyInteraction
 import ReplayKit
@@ -65,6 +66,7 @@ struct PeerReading {
     var measurementSeq: UInt32 = 0
     var aligner = PoseAligner()
     var lastPairTime: TimeInterval = 0     // last time UWB tied the two worlds together
+    var theirUwbOff = false                // they told us they can't run UWB (Bluetooth off on their phone)
 
     /// Their position (their world) now: last pose, carried forward by their velocity over the time since it
     /// arrived plus the link delay, so the tag doesn't trail them.
@@ -95,6 +97,12 @@ private func median(_ points: [SIMD3<Float>]) -> SIMD3<Float> {
 final class UWBTracker: NSObject {
     private(set) var readings: [MCPeerID: PeerReading] = [:]
     private(set) var status = "Starting…"
+    /// Bluetooth as CoreBluetooth reports it: "on", "off", "unauthorized", "unsupported" or "unknown".
+    /// UWB needs Bluetooth on; iOS pauses every Nearby Interaction session while it's off.
+    private(set) var bluetooth = "unknown"
+    /// True only when we know Bluetooth is off. Unknown or unauthorized (can't tell) still tries UWB.
+    var uwbBlocked: Bool { bluetooth == "off" }
+    private var bluetoothMonitor: CBCentralManager?
     /// Timestamped pairing steps ("2.4s  Linked with Phone-AB"), newest last, for the pairing menu.
     private(set) var timeline: [String] = []
     private let startTime = CACurrentMediaTime()
@@ -148,6 +156,7 @@ final class UWBTracker: NSObject {
         link.onDisconnected = { [weak self] in self?.disconnected($0) }
         link.onToken = { [weak self] in self?.received(token: $1, from: $0) }
         link.onState = { [weak self] in self?.received(state: $1, from: $0) }
+        link.onUwbAvailable = { [weak self] peer, available in self?.peer(peer, uwbAvailable: available) }
         link.onLog = { [weak self] in self?.note($0) }
         link.onEvent = { [weak self] in self?.event($0) }
     }
@@ -167,12 +176,17 @@ final class UWBTracker: NSObject {
 
     func start() {
         guard Self.isSupported else { note("This iPhone has no UWB chip"); return }
+        // Only reads the Bluetooth state (no scanning). We show our own dialog, so no system power alert.
+        bluetoothMonitor = CBCentralManager(delegate: self, queue: .main,
+                                            options: [CBCentralManagerOptionShowPowerAlertKey: false])
         link.start()
         event(link.code.map { "Looking for phones using code \($0)" } ?? "Looking for nearby phones")
         note(link.code.map { "Looking for the phone using code \($0)…" } ?? "Looking for the other phone…")
     }
 
     func stop() {
+        bluetoothMonitor?.delegate = nil
+        bluetoothMonitor = nil
         sessions.values.forEach { $0.invalidate() }
         sessions.removeAll()
         link.stop()
@@ -187,10 +201,21 @@ final class UWBTracker: NSObject {
         }
         linkedAt[peer] = CACurrentMediaTime()
         droppedAt[peer] = nil
+        link.send(uwbAvailable: !uwbBlocked, to: peer)
+        guard !uwbBlocked else {
+            // No UWB without Bluetooth: stay linked (poses and the camera still work) but don't start a session
+            // iOS would only pause. bluetoothChanged() starts it once Bluetooth is back on.
+            if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
+            note("Connected to \(peer.displayName). Bluetooth is off, so no UWB")
+            return
+        }
         note("Connected to \(peer.displayName). Preparing UWB token…")
         if sessions[peer] == nil { _ = makeSession(for: peer) }
         if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
         sendToken(to: peer, attempt: 1)
+        // Already holding their token (kept while Bluetooth was off, or from before our session failed): run with
+        // it now. If it's out of date, the fresh one they send back in reply to ours re-runs the session.
+        if tokens[peer] != nil { run(peer) }
     }
 
     private func makeSession(for peer: MCPeerID) -> NISession {
@@ -202,7 +227,9 @@ final class UWBTracker: NSObject {
         let assist = usesAssist(peer)
         if assist { s.setARSession(arSession) }
         sessions[peer] = s
-        readings[peer] = PeerReading(name: peer.displayName, cameraAssist: assist)
+        var r = PeerReading(name: peer.displayName, cameraAssist: assist)
+        r.theirUwbOff = readings[peer]?.theirUwbOff ?? false
+        readings[peer] = r
         return s
     }
 
@@ -259,6 +286,12 @@ final class UWBTracker: NSObject {
     }
 
     private func received(token: NIDiscoveryToken, from peer: MCPeerID) {
+        if uwbBlocked {
+            // Keep it for when Bluetooth comes back; running a session now would just be paused by iOS.
+            tokens[peer] = token
+            if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
+            return
+        }
         if sessions[peer] == nil {
             // Token beat the connect callback, or our session just failed. Don't rebuild a
             // session that keeps failing: that's what made the status flip endlessly.
@@ -331,7 +364,7 @@ final class UWBTracker: NSObject {
         // iOS pauses UWB whenever the app isn't frontmost (consent prompts, Control Center, screen lock) and
         // is meant to say when it may resume, but that callback doesn't always come. If we're active again
         // and a session is still paused, rebuild it rather than leaving tracking stopped for good.
-        guard UIApplication.shared.applicationState == .active else {
+        guard UIApplication.shared.applicationState == .active, !uwbBlocked else {
             for peer in suspendedAt.keys { suspendedAt[peer] = now }   // count the grace from when we're back
             return
         }
@@ -345,6 +378,38 @@ final class UWBTracker: NSObject {
             pauseRebuilds[peer] = tries + 1
             event("UWB with \(peer.displayName) stayed paused; restarting it (try \(tries + 1))")
             rebuildSession(for: peer)
+        }
+    }
+
+    /// The other phone told us whether it can run UWB.
+    private func peer(_ peer: MCPeerID, uwbAvailable: Bool) {
+        if readings[peer] == nil { readings[peer] = PeerReading(name: peer.displayName) }
+        guard readings[peer]?.theirUwbOff != !uwbAvailable else { return }
+        readings[peer]?.theirUwbOff = !uwbAvailable
+        event(uwbAvailable ? "\(peer.displayName) has UWB again" : "\(peer.displayName) has Bluetooth off: no UWB with them")
+    }
+
+    /// Bluetooth went on or off. Off: end every UWB session (iOS would only keep them paused) and tell the other
+    /// phones. On: start UWB with everyone we're linked to, from a fresh token swap.
+    fileprivate func bluetoothChanged(to state: String) {
+        let wasBlocked = uwbBlocked
+        bluetooth = state
+        guard uwbBlocked != wasBlocked else { return }
+        if uwbBlocked {
+            event("Bluetooth is off: UWB stopped")
+            note("Bluetooth is off. Turn it on for UWB distance and direction")
+            for (peer, s) in sessions {
+                sessions[peer] = nil   // detach first so the invalidate callback ignores it
+                s.invalidate()
+            }
+            tokens.removeAll()          // their tokens were for sessions that have now ended
+            suspendedAt.removeAll()
+            pauseRebuilds.removeAll()
+        } else {
+            event("Bluetooth is on: starting UWB")
+        }
+        for peer in readings.keys where link.isConnected(peer) {
+            if uwbBlocked { link.send(uwbAvailable: false, to: peer) } else { connected(peer) }
         }
     }
 
@@ -397,7 +462,10 @@ final class UWBTracker: NSObject {
             // Not until the UWB tokens are swapped and the link has held for a second: streaming 60 poses/sec
             // into a link that's still settling (often moving from Bluetooth to Wi-Fi) delays the token
             // behind it or drops the connection, which is what slowed pairing down.
-            guard tokens[peer] != nil, let since = linkedAt[peer], now - since > 1 else { continue }
+            // Without UWB on either side there's no token swap to protect, and their poses are what lets the
+            // camera keep an existing alignment (and so the blip) alive.
+            let noUwb = uwbBlocked || r.theirUwbOff
+            guard tokens[peer] != nil || noUwb, let since = linkedAt[peer], now - since > 1 else { continue }
             let fresh = r.measurement != nil && now - r.positionTime < 0.5
             link.send(state: PeerState(time: clock, epoch: epoch, position: myPosition, measurementSeq: r.measurementSeq,
                                        measurement: fresh ? r.measurement : nil), to: peer)
@@ -614,6 +682,18 @@ extension UWBTracker: NISessionDelegate {
             _ = self.makeSession(for: peer)
             self.sendToken(to: peer, attempt: 1)
             self.run(peer)
+        }
+    }
+}
+
+extension UWBTracker: CBCentralManagerDelegate {
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn: bluetoothChanged(to: "on")
+        case .poweredOff: bluetoothChanged(to: "off")
+        case .unauthorized: bluetoothChanged(to: "unauthorized")
+        case .unsupported: bluetoothChanged(to: "unsupported")
+        default: bluetoothChanged(to: "unknown")   // resetting / not yet known
         }
     }
 }

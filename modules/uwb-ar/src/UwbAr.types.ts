@@ -32,6 +32,12 @@ export type UwbPeer = {
   snapped: boolean;
   /** No UWB reading for 2+ seconds and no AR tracking from them to fall back on. */
   stale: boolean;
+  /** Bluetooth is off on this phone, so no UWB with anyone. */
+  uwbOffHere: boolean;
+  /** Bluetooth is off on their phone, so no UWB with them. */
+  uwbOffThere: boolean;
+  /** No UWB and the camera isn't on them: the marker and tag are yellow and the position is a rough estimate. */
+  approximate: boolean;
 };
 
 export type UwbStatus = {
@@ -43,6 +49,8 @@ export type UwbStatus = {
   timeline: string[];
   /** The code in use; empty = automatic pairing. */
   pairingCode: string;
+  /** UWB needs Bluetooth on. 'unauthorized' = can't tell (permission denied); UWB is still attempted. */
+  bluetooth: 'on' | 'off' | 'unauthorized' | 'unsupported' | 'unknown';
 };
 
 export type UwbArViewProps = ViewProps & {
