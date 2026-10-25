@@ -1,5 +1,6 @@
 import ARKit
 import MultipeerConnectivity
+import ReplayKit
 import Vision
 
 /// Snaps a peer's tag onto the person holding the phone while they're in view.
@@ -39,13 +40,20 @@ final class PersonSnapper {
     /// Upper body (head to waist) height in meters, for a rough distance from box size.
     private static let bodyHeight: Float = 0.8
 
-    /// Call every AR frame. Runs detection on every other frame while the previous one isn't still running.
+    /// Call every AR frame. Runs detection on every other frame (every third while broadcasting, which is
+    /// already encoding the screen) while the previous one isn't still running.
     func process(_ frame: ARFrame, targets: [MCPeerID: Target]) {
         frameCount += 1
-        guard frameCount % 2 == 0, !busy, !targets.isEmpty, case .normal = frame.camera.trackingState else { return }
+        let every = RPScreenRecorder.shared().isRecording ? 3 : 2
+        guard frameCount % every == 0, !busy, !targets.isEmpty, case .normal = frame.camera.trackingState else { return }
+        let camera = frame.camera.transform
+        // A person can only be matched to a peer within a few degrees of the camera's view, so with every peer
+        // behind us there's nothing to find: skip Vision entirely.
+        let origin = SIMD3(camera.columns.3.x, camera.columns.3.y, camera.columns.3.z)
+        let forward = -SIMD3(camera.columns.2.x, camera.columns.2.y, camera.columns.2.z)
+        guard targets.values.contains(where: { simd_dot($0.ours - origin, forward) > 0 }) else { return }
         busy = true
         let image = frame.capturedImage
-        let camera = frame.camera.transform
         let intrinsics = frame.camera.intrinsics
         let size = frame.camera.imageResolution
         let time = CACurrentMediaTime()
