@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Animated, LayoutAnimation, Linking, Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput,
-  useWindowDimensions, View,
+  useWindowDimensions, View, type StyleProp, type ViewProps, type ViewStyle,
 } from 'react-native';
+import { GlassView, isLiquidGlassAvailable } from 'expo-glass-effect';
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
 import { BroadcastPanel, SERVER, useBroadcast, type Broadcast } from './modules/uwb-ar/BroadcastControls';
 import { WaypointControls } from './modules/uwb-ar/WaypointControls';
+
+// Liquid Glass needs iOS 26+. Elsewhere panels fall back to translucent dark fills.
+const GLASS = isLiquidGlassAvailable();
 
 // Screen margins the HUD keeps clear (top status bar, bottom panel). Inside them the native view
 // draws each peer's name tag; outside them we draw an edge arrow.
@@ -62,7 +66,7 @@ export default function App() {
 
       {/* One row so the pairing button always matches the status bar's height. */}
       <View style={styles.topBar}>
-        <View style={styles.topCard}>
+        <Surface style={styles.topCard} fallback={styles.hudFill}>
           <Text style={styles.cardText}>
             {name} · {status?.status ?? 'Starting…'}
           </Text>
@@ -72,7 +76,7 @@ export default function App() {
           {bluetooth === 'off' && (
             <Text style={styles.warn}>Bluetooth off: no UWB. Yellow positions are rough estimates</Text>
           )}
-        </View>
+        </Surface>
 
         <Pressable
           accessibilityRole="button"
@@ -80,6 +84,7 @@ export default function App() {
           onPress={() => setMenuOpen(true)}
           style={styles.pairButton}
         >
+          <Surface style={styles.pairFill} fallback={styles.hudFill} pointerEvents="none" />
           <Text style={styles.pairIcon}>⇄</Text>
           {pairingCode !== '' && <Text style={styles.pairBadge}>{pairingCode}</Text>}
           {live && <View style={styles.liveDot} accessibilityLabel="Broadcasting" />}
@@ -176,7 +181,7 @@ function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={styles.sheetBackdrop}>
-        <View style={styles.sheet}>
+        <Surface style={styles.sheet} fallback={styles.sheetFill}>
           <View style={styles.sheetHeader}>
             <Text style={styles.sheetTitle}>{mode === 'pairing' ? 'Pairing' : 'Broadcast'}</Text>
             <Pressable accessibilityRole="button" accessibilityLabel="Close" onPress={onClose} hitSlop={12}>
@@ -270,7 +275,7 @@ function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset
               ))}
             </ScrollView>
           </>}
-        </View>
+        </Surface>
       </View>
     </Modal>
   );
@@ -289,7 +294,7 @@ function BluetoothDialog({ visible, state, onContinue }: {
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onContinue}>
       <View style={styles.dialogBackdrop}>
-        <View style={styles.dialog}>
+        <Surface style={styles.dialog} fallback={styles.sheetFill}>
           <Text style={styles.sheetTitle}>{unauthorized ? 'Allow Bluetooth' : 'Turn on Bluetooth'}</Text>
           <Text style={styles.dialogText}>
             {unauthorized
@@ -307,9 +312,18 @@ function BluetoothDialog({ visible, state, onContinue }: {
           <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet, styles.dialogButton]} onPress={onContinue}>
             <Text style={styles.buttonText}>Continue without UWB</Text>
           </Pressable>
-        </View>
+        </Surface>
       </View>
     </Modal>
+  );
+}
+
+/** A panel: Liquid Glass where the system supports it, otherwise the given translucent fill. */
+function Surface({ style, fallback, children, ...rest }: ViewProps & { fallback: StyleProp<ViewStyle> }) {
+  return GLASS ? (
+    <GlassView glassEffectStyle="regular" colorScheme="dark" style={style} {...rest}>{children}</GlassView>
+  ) : (
+    <View style={[style, fallback]} {...rest}>{children}</View>
   );
 }
 
@@ -361,10 +375,9 @@ const styles = StyleSheet.create({
     position: 'absolute', top: 56, left: 12, right: 12,
     flexDirection: 'row', alignItems: 'stretch', gap: 8,
   },
-  topCard: {
-    flex: 1, minHeight: 44, justifyContent: 'center',
-    backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12, padding: 10,
-  },
+  topCard: { flex: 1, minHeight: 44, justifyContent: 'center', borderRadius: 12, padding: 10 },
+  hudFill: { backgroundColor: 'rgba(0,0,0,0.55)' },
+  sheetFill: { backgroundColor: 'rgba(28,28,30,0.86)' },
   cardText: { color: 'white', fontSize: 14, fontWeight: '600' },
   warn: { color: '#ffcc00', fontSize: 13, marginTop: 4 },
   edge: {
@@ -375,18 +388,16 @@ const styles = StyleSheet.create({
   arrowApproximate: { color: '#ffcc00' },
   noUwbText: { color: '#ffcc00' },
   dialogBackdrop: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: 'rgba(0,0,0,0.6)' },
-  dialog: { backgroundColor: '#1c1c1e', borderRadius: 16, padding: 20, borderWidth: 1, borderColor: '#ffcc00' },
+  dialog: { borderRadius: 16, padding: 20, borderWidth: 1, borderColor: '#ffcc00' },
   dialogText: { color: '#ddd', fontSize: 15, marginTop: 10, lineHeight: 21 },
   dialogButton: { flex: 0, marginTop: 14 },
   edgeText: { color: 'white', fontSize: 12, fontWeight: '600' },
-  pairButton: {
-    width: 48, minHeight: 44, alignItems: 'center', justifyContent: 'center',
-    backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12,
-  },
+  pairButton: { width: 48, minHeight: 44, alignItems: 'center', justifyContent: 'center', borderRadius: 12 },
+  pairFill: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, borderRadius: 12 },
   pairIcon: { color: 'white', fontSize: 22, fontWeight: '700' },
   pairBadge: { color: '#34c759', fontSize: 10, fontWeight: '700' },
   liveDot: { position: 'absolute', top: 6, right: 6, width: 8, height: 8, borderRadius: 4, backgroundColor: '#ff3b30' },
-  tabs: { flexDirection: 'row', backgroundColor: '#2c2c2e', borderRadius: 10, padding: TAB_PAD, gap: TAB_GAP },
+  tabs: { flexDirection: 'row', backgroundColor: 'rgba(118,118,128,0.24)', borderRadius: 10, padding: TAB_PAD, gap: TAB_GAP },
   tabHighlight: {
     position: 'absolute', top: TAB_PAD, bottom: TAB_PAD, left: TAB_PAD, borderRadius: 8,
     backgroundColor: 'rgba(255,255,255,0.18)',
@@ -396,10 +407,8 @@ const styles = StyleSheet.create({
   tabText: { color: 'white', fontSize: 14, fontWeight: '700' },
   tabHint: { color: '#8e8e93', fontSize: 12, marginTop: 6 },
   sheetBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.35)' },
-  sheet: {
-    backgroundColor: '#1c1c1e', borderTopLeftRadius: 20, borderTopRightRadius: 20,
-    padding: 20, paddingBottom: 40, maxHeight: '80%',
-  },
+  // Floating card with even corners: Liquid Glass rounds all four, and the fallback matches it.
+  sheet: { margin: 8, borderRadius: 28, padding: 20, paddingBottom: 28, maxHeight: '80%', overflow: 'hidden' },
   sheetHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   sheetTitle: { color: 'white', fontSize: 20, fontWeight: '700' },
   sheetClose: { color: '#aaa', fontSize: 20 },
