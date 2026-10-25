@@ -46,10 +46,39 @@ struct PeerReading {
     var assistActive = false           // camera assistance has reported in at least once
     var lastUpdate: TimeInterval = 0   // 0 = no reading yet
     var positionTime: TimeInterval = 0 // when worldPosition was last measured
-    var recent: [SIMD3<Float>] = []    // last few raw positions, for rejecting one-off bad readings
+    var recent: [SIMD3<Float>] = []    // last 3 raw positions, for rejecting one-off bad readings
     // Up/down (y) gets a lower cutoff: UWB elevation is the noisiest axis and people rarely move vertically.
-    var positionFilter = OneEuroFilter(minCutoff: SIMD3(0.4, 0.15, 0.4), beta: 0.8)
+    // beta 1.2 (was 0.8): loosens faster when the other person moves, so the marker lags less behind them.
+    var positionFilter = OneEuroFilter(minCutoff: SIMD3(0.4, 0.15, 0.4), beta: 1.2)
     var distanceFilter = OneEuroFilter(minCutoff: SIMD3(repeating: 0.5), beta: 0.5)   // only .x is used
+
+    // AR fusion: their own ARKit tracking, streamed over the link, placed in our world by `aligner`.
+    var theirPosition: SIMD3<Float>?       // their phone in THEIR AR world
+    var theirPositionTime: TimeInterval = 0
+    var theirVelocity = SIMD3<Float>(repeating: 0)   // their world, m/s, from their own timestamps
+    var theirClock: UInt32?                // their timestamp (ms) for theirPosition
+    var theirEpoch: UInt32?
+    var theirMeasurementSeq: UInt32?       // last of their UWB fixes of us we've used
+    var measurement: SIMD3<Float>?         // our latest raw UWB fix of them (our world), streamed to them
+    var measurementSeq: UInt32 = 0
+    var aligner = PoseAligner()
+    var lastPairTime: TimeInterval = 0     // last time UWB tied the two worlds together
+
+    /// Their position (their world) now: last pose, carried forward by their velocity over the time since it
+    /// arrived plus the link delay, so the tag doesn't trail them.
+    func theirPredicted(at now: TimeInterval) -> SIMD3<Float>? {
+        guard let p = theirPosition, now - theirPositionTime < 0.5 else { return nil }
+        let ahead = Float(min(now - theirPositionTime + UWBTracker.linkDelay, 0.12))
+        return p + theirVelocity * ahead
+    }
+}
+
+/// Where to draw a peer this frame.
+struct PeerFix {
+    var position: SIMD3<Float>   // our AR world
+    var distance: Float?
+    var fused: Bool              // from their ARKit tracking + alignment, not straight from UWB
+    var estimated: Bool          // UWB hasn't confirmed it lately (e.g. behind a wall): their tracking alone
 }
 
 /// Per-axis median, so a single reflected reading can't yank the marker.
@@ -72,6 +101,16 @@ final class UWBTracker: NSObject {
     private var restarts: [MCPeerID: Int] = [:]
     private var plainSessions = Set<MCPeerID>()   // peers where iOS rejected camera assistance
 
+    // Our own ARKit pose, shared with the other phones.
+    private var epoch: UInt32 = 0                 // bumped when our AR world jumps
+    private var myPosition: SIMD3<Float>?         // nil while tracking isn't normal
+    private var myPositionTime: TimeInterval = 0
+    private var wasRelocalizing = false
+    private var lastStateSent: TimeInterval = 0
+
+    /// Rough one-way delay of the pose stream (Wi-Fi/Bluetooth peer link), used to predict their position.
+    static let linkDelay: TimeInterval = 0.04
+
     static var isSupported: Bool { NISession.deviceCapabilities.supportsPreciseDistanceMeasurement }
     static var supportsCameraAssistance: Bool { NISession.deviceCapabilities.supportsCameraAssistance }
     /// iPhone 11–13: UWB alone gives direction. iPhone 14+ only gets direction via camera assistance.
@@ -90,6 +129,7 @@ final class UWBTracker: NSObject {
         link.onConnected = { [weak self] in self?.connected($0) }
         link.onDisconnected = { [weak self] in self?.disconnected($0) }
         link.onToken = { [weak self] in self?.received(token: $1, from: $0) }
+        link.onState = { [weak self] in self?.received(state: $1, from: $0) }
         link.onLog = { [weak self] in self?.note($0) }
     }
 
@@ -224,6 +264,109 @@ final class UWBTracker: NSObject {
     private func peer(for session: NISession) -> MCPeerID? {
         sessions.first(where: { $0.value === session })?.key
     }
+
+    // MARK: AR fusion
+
+    /// Call every AR frame: tracks our pose and streams it (with our latest UWB fix) every frame, 60x/sec.
+    /// 30x/sec moved the tag only every other drawn frame, a visible step when they walk.
+    func update(with frame: ARFrame) {
+        let now = CACurrentMediaTime()
+        var normal = false, relocalizing = false
+        switch frame.camera.trackingState {
+        case .normal: normal = true
+        case .limited(.relocalizing): relocalizing = true
+        default: break
+        }
+        let t = frame.camera.transform.columns.3
+        let pos = SIMD3(t.x, t.y, t.z)
+        // ARKit moved our world (relocalized, or snapped >30 cm in one frame): every pair so far is in the old one.
+        let snapped = myPosition.map { simd_distance($0, pos) > 0.3 && now - myPositionTime < 0.1 } ?? false
+        if (wasRelocalizing && !relocalizing) || snapped {
+            epoch &+= 1
+            for peer in readings.keys {
+                readings[peer]?.aligner.reset()
+                readings[peer]?.measurement = nil
+            }
+            NSLog("[UWBHud] AR world jumped; re-aligning")
+        }
+        wasRelocalizing = relocalizing
+        myPosition = normal ? pos : nil
+        myPositionTime = now
+
+        guard now - lastStateSent >= 1.0 / 65 else { return }   // ARKit runs at 60 fps; cap on 120 Hz screens
+        lastStateSent = now
+        let clock = UInt32(truncatingIfNeeded: Int64(frame.timestamp * 1000))
+        for (peer, r) in readings {
+            let fresh = r.measurement != nil && now - r.positionTime < 0.5
+            link.send(state: PeerState(time: clock, epoch: epoch, position: myPosition, measurementSeq: r.measurementSeq,
+                                       measurement: fresh ? r.measurement : nil), to: peer)
+        }
+    }
+
+    private func received(state: PeerState, from peer: MCPeerID) {
+        guard var r = readings[peer] else { return }
+        let now = CACurrentMediaTime()
+        if r.theirEpoch != state.epoch {   // their world jumped: old pairs are meaningless
+            r.aligner.reset()
+            r.theirEpoch = state.epoch
+            r.theirMeasurementSeq = nil
+            r.theirClock = nil
+        }
+        if let p = state.position {
+            // Velocity from their timestamps, not arrival times: the link delivers in bursts.
+            if let old = r.theirPosition, let oldClock = r.theirClock {
+                let dt = Float(Int32(bitPattern: state.time &- oldClock)) / 1000
+                guard dt > 0 else { return }   // late or duplicate packet: ignore
+                if dt < 0.2 {
+                    var v = (p - old) / dt
+                    let speed = simd_length(v)
+                    if speed > 4 { v *= 4 / speed }   // nobody walks faster; keeps a glitch from flinging the tag
+                    // Time-based (~0.12 s), so the 60 Hz stream doesn't let more hand shake through than 30 Hz did.
+                    r.theirVelocity += (1 - exp(-dt / 0.12)) * (v - r.theirVelocity)
+                } else {
+                    r.theirVelocity = .zero
+                }
+            }
+            r.theirClock = state.time
+            r.theirPositionTime = now
+        }
+        r.theirPosition = state.position
+        // Their UWB fix of us (their world) ↔ where we are (our world).
+        if let m = state.measurement, state.measurementSeq != r.theirMeasurementSeq, let me = myPosition {
+            r.theirMeasurementSeq = state.measurementSeq
+            let range = state.position.map { simd_distance($0, m) } ?? r.distance ?? 3
+            if r.aligner.add(theirs: m, ours: me, at: now, range: range) { r.lastPairTime = now }
+        }
+        readings[peer] = r
+    }
+
+    /// Where to draw the peer now: their own tracking mapped into our world once the alignment is solid,
+    /// otherwise the UWB position. Holds through UWB dropouts for up to 30 s while their poses keep coming.
+    func fix(for peer: MCPeerID, at now: TimeInterval) -> PeerFix? {
+        guard let r = readings[peer] else { return nil }
+        let uwbFresh = r.lastUpdate > 0 && now - r.lastUpdate <= 2
+        if let b = r.theirPredicted(at: now), now - r.lastPairTime < 30,
+           let q = readings[peer]?.aligner.map(b, at: now) {
+            let estimated = now - r.lastPairTime > 1.5
+            // While estimated, UWB distance is the reflection's (reads long behind walls): use the tag's own.
+            let distance = uwbFresh && !estimated ? r.distance : myPosition.map { simd_distance($0, q) }
+            return PeerFix(position: q, distance: distance, fused: true, estimated: estimated)
+        }
+        guard uwbFresh, let p = r.worldPosition else { return nil }
+        return PeerFix(position: p, distance: r.distance, fused: false, estimated: false)
+    }
+
+    /// The camera matched the peer to a person: a far better bearing than UWB's. Fed in as a half-weight
+    /// pair with no height (the phone isn't at the middle of the body) and never allowed to force a
+    /// re-alignment, so a wrong match is simply rejected.
+    func addCameraFix(for peer: MCPeerID, point: SIMD3<Float>, target: PersonSnapper.Target, at time: TimeInterval) {
+        guard let theirs = target.theirs, let me = myPosition, readings[peer]?.aligner.fit != nil else { return }
+        let ours = SIMD3(point.x, target.ours.y, point.z)
+        if readings[peer]?.aligner.add(theirs: theirs, ours: ours, at: time, range: simd_distance(me, ours),
+                                       weight: 0.5, canRealign: false) == true {
+            readings[peer]?.lastPairTime = time
+        }
+    }
 }
 
 extension UWBTracker: NISessionDelegate {
@@ -243,12 +386,19 @@ extension UWBTracker: NISessionDelegate {
             p = SIMD3(w.x, w.y, w.z)
         }
         if let q = p, q.x.isFinite, q.y.isFinite, q.z.isFinite {
+            // Our UWB fix of them (our world) ↔ their streamed position (their world), taken together.
+            r.measurement = q
+            r.measurementSeq &+= 1
+            if let b = r.theirPredicted(at: now), now - r.theirPositionTime < 0.25, let me = myPosition,
+               r.aligner.add(theirs: b, ours: q, at: now, range: simd_distance(me, q)) {
+                r.lastPairTime = now
+            }
             if now - r.positionTime > 1.5 {   // after a real gap, start fresh rather than sliding from the old spot
                 r.recent.removeAll()
                 r.positionFilter.reset()
             }
             r.recent.append(q)
-            if r.recent.count > 5 { r.recent.removeFirst() }
+            if r.recent.count > 3 { r.recent.removeFirst() }   // 3, not 5: one reading less delay
             r.worldPosition = r.positionFilter.filter(median(r.recent), at: now)
             r.positionTime = now
         } else if now - r.positionTime > 1.5 {
