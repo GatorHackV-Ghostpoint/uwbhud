@@ -16,6 +16,12 @@ public class UwbArModule: Module {
             Prop("displayName") { (view: UwbArView, name: String) in
                 view.displayName = String(name.prefix(40))
             }
+
+            // [top, bottom, side] screen margins the JS HUD keeps clear; outside them a peer gets an edge arrow.
+            Prop("tagInsets") { (view: UwbArView, insets: [Double]) in
+                guard insets.count == 3 else { return }
+                view.tagInsets = (top: insets[0], bottom: insets[1], side: insets[2])
+            }
         }
     }
 }

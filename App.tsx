@@ -2,8 +2,10 @@ import { useMemo, useState } from 'react';
 import { StatusBar, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
 
-// Screen margins the HUD keeps clear (top status bar, bottom panel).
+// Screen margins the HUD keeps clear (top status bar, bottom panel). Inside them the native view
+// draws each peer's name tag; outside them we draw an edge arrow.
 const INSET = { top: 130, bottom: 150, side: 30 };
+const TAG_INSETS: [number, number, number] = [INSET.top, INSET.bottom, INSET.side];
 
 export default function App() {
   const [peers, setPeers] = useState<UwbPeer[]>([]);
@@ -20,7 +22,7 @@ export default function App() {
     );
   }
 
-  const located = peers.filter((p) => p.hasPosition && !p.stale);
+  const offScreen = peers.filter((p) => p.hasPosition && !p.stale && !p.onScreen);
   const waiting = peers.filter((p) => !p.hasPosition || p.stale);
 
   return (
@@ -29,12 +31,13 @@ export default function App() {
       <UwbArView
         style={StyleSheet.absoluteFill}
         displayName={name}
+        tagInsets={TAG_INSETS}
         onPeers={(e) => setPeers(e.nativeEvent.peers)}
         onStatus={(e) => setStatus(e.nativeEvent)}
       />
 
-      {located.map((p) => (
-        <PeerMarker key={p.id} peer={p} />
+      {offScreen.map((p) => (
+        <EdgeArrow key={p.id} peer={p} />
       ))}
 
       <View style={[styles.card, styles.top]}>
@@ -64,22 +67,9 @@ export default function App() {
   );
 }
 
-/** Name tag over the person when on screen; arrow pinned to the edge when not. */
-function PeerMarker({ peer }: { peer: UwbPeer }) {
+/** Arrow pinned to the screen edge for a peer that's off screen (the native view draws on-screen tags). */
+function EdgeArrow({ peer }: { peer: UwbPeer }) {
   const { width, height } = useWindowDimensions();
-  const onScreen =
-    peer.inFront &&
-    peer.x > INSET.side && peer.x < width - INSET.side &&
-    peer.y > INSET.top && peer.y < height - INSET.bottom;
-
-  if (onScreen) {
-    return (
-      <View pointerEvents="none" style={[styles.tag, { left: peer.x - 70, top: peer.y - 80 }]}>
-        <Text style={styles.tagName}>{peer.name}</Text>
-        <Text style={styles.tagDist}>{formatDistance(peer.distance)}</Text>
-      </View>
-    );
-  }
 
   // Walk from screen center along the peer's direction until we hit the safe-area edge.
   const cx = width / 2, cy = height / 2;
@@ -120,12 +110,6 @@ const styles = StyleSheet.create({
   bottom: { bottom: 40 },
   cardText: { color: 'white', fontSize: 14, fontWeight: '600' },
   warn: { color: '#ffcc00', fontSize: 13, marginTop: 4 },
-  tag: {
-    position: 'absolute', width: 140, alignItems: 'center',
-    backgroundColor: 'rgba(52,199,89,0.85)', borderRadius: 12, paddingVertical: 6,
-  },
-  tagName: { color: 'white', fontSize: 15, fontWeight: '700' },
-  tagDist: { color: 'white', fontSize: 13 },
   edge: {
     position: 'absolute', width: 110, alignItems: 'center',
     backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 12, paddingVertical: 6,

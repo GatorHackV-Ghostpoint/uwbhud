@@ -46,9 +46,10 @@ struct PeerReading {
     var assistActive = false           // camera assistance has reported in at least once
     var lastUpdate: TimeInterval = 0   // 0 = no reading yet
     var positionTime: TimeInterval = 0 // when worldPosition was last measured
-    var recent: [SIMD3<Float>] = []    // last few raw positions, for rejecting one-off bad readings
+    var recent: [SIMD3<Float>] = []    // last 3 raw positions, for rejecting one-off bad readings
     // Up/down (y) gets a lower cutoff: UWB elevation is the noisiest axis and people rarely move vertically.
-    var positionFilter = OneEuroFilter(minCutoff: SIMD3(0.4, 0.15, 0.4), beta: 0.8)
+    // beta 1.2 (was 0.8): loosens faster when the other person moves, so the marker lags less behind them.
+    var positionFilter = OneEuroFilter(minCutoff: SIMD3(0.4, 0.15, 0.4), beta: 1.2)
     var distanceFilter = OneEuroFilter(minCutoff: SIMD3(repeating: 0.5), beta: 0.5)   // only .x is used
 }
 
@@ -248,7 +249,7 @@ extension UWBTracker: NISessionDelegate {
                 r.positionFilter.reset()
             }
             r.recent.append(q)
-            if r.recent.count > 5 { r.recent.removeFirst() }
+            if r.recent.count > 3 { r.recent.removeFirst() }   // 3, not 5: one reading less delay
             r.worldPosition = r.positionFilter.filter(median(r.recent), at: now)
             r.positionTime = now
         } else if now - r.positionTime > 1.5 {
