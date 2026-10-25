@@ -13,6 +13,7 @@
       "infoPlist": {
         "NSCameraUsageDescription": "Shows nearby people on the camera view",
         "NSNearbyInteractionUsageDescription": "Measures distance and direction to nearby phones",
+        "NSBluetoothAlwaysUsageDescription": "Checks that Bluetooth is on, which distance and direction to nearby phones (UWB) needs",
         "NSLocalNetworkUsageDescription": "Finds nearby phones running UWBHud",
         "NSBonjourServices": ["_uwbhud._tcp", "_uwbhud._udp"],
         "UIRequiredDeviceCapabilities": ["arkit"]

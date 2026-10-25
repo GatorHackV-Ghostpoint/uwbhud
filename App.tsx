@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
-  Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, useWindowDimensions, View,
+  Linking, Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, useWindowDimensions, View,
 } from 'react-native';
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
 import { BroadcastControls } from './modules/uwb-ar/BroadcastControls';
@@ -20,6 +20,8 @@ export default function App() {
   const [pairingCode, setPairingCode] = useState(''); // '' = automatic
   const [menuOpen, setMenuOpen] = useState(false);
   const [resetKey, setResetKey] = useState(0);
+  // "Continue without UWB" hides the Bluetooth dialog until Bluetooth has been on again.
+  const [bluetoothDismissed, setBluetoothDismissed] = useState(false);
   const [name] = useState(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase());
   const supported = useMemo(() => isUwbSupported(), []);
 
@@ -34,6 +36,8 @@ export default function App() {
 
   const offScreen = peers.filter((p) => p.hasPosition && !p.stale && !p.onScreen);
   const waiting = peers.filter((p) => !p.hasPosition || p.stale);
+  const bluetooth = status?.bluetooth ?? 'unknown';
+  const bluetoothProblem = bluetooth === 'off' || bluetooth === 'unauthorized';
 
   return (
     <View style={styles.fill}>
@@ -45,7 +49,10 @@ export default function App() {
         resetKey={resetKey}
         tagInsets={TAG_INSETS}
         onPeers={(e) => setPeers(e.nativeEvent.peers)}
-        onStatus={(e) => setStatus(e.nativeEvent)}
+        onStatus={(e) => {
+          setStatus(e.nativeEvent);
+          if (e.nativeEvent.bluetooth === 'on') setBluetoothDismissed(false);
+        }}
       />
 
       {offScreen.map((p) => (
@@ -61,6 +68,9 @@ export default function App() {
           {status && !status.directionSupported && (
             <Text style={styles.warn}>This iPhone can measure distance but not direction</Text>
           )}
+          {bluetooth === 'off' && (
+            <Text style={styles.warn}>Bluetooth off: no UWB. Yellow positions are rough estimates</Text>
+          )}
         </View>
 
         <Pressable
@@ -74,6 +84,13 @@ export default function App() {
         </Pressable>
       </View>
 
+      {/* iOS shows one modal at a time, so this waits while the pairing sheet is open. */}
+      <BluetoothDialog
+        visible={bluetoothProblem && !bluetoothDismissed && !menuOpen}
+        state={bluetooth}
+        onContinue={() => setBluetoothDismissed(true)}
+      />
+
       <PairingMenu
         visible={menuOpen}
         code={pairingCode}
@@ -85,16 +102,23 @@ export default function App() {
 
       {waiting.length > 0 && (
         <View style={[styles.card, styles.bottom]}>
-          {waiting.map((p) => (
-            <Text key={p.id} style={styles.cardText}>
-              {p.name}: {formatDistance(p.distance)}
-              {p.stale
-                ? ' (signal lost)'
-                : p.distance == null
-                  ? '. Waiting for UWB…'
-                  : `. ${p.guidance ?? directionHint(p)}`}
-            </Text>
-          ))}
+          {waiting.map((p) =>
+            p.uwbOffHere || p.uwbOffThere ? (
+              <Text key={p.id} style={[styles.cardText, styles.noUwbText]}>
+                {p.name}: no UWB ({p.uwbOffHere ? 'Bluetooth is off on this phone' : 'Bluetooth is off on their phone'}).
+                Position unavailable
+              </Text>
+            ) : (
+              <Text key={p.id} style={styles.cardText}>
+                {p.name}: {formatDistance(p.distance)}
+                {p.stale
+                  ? ' (signal lost)'
+                  : p.distance == null
+                    ? '. Waiting for UWB…'
+                    : `. ${p.guidance ?? directionHint(p)}`}
+              </Text>
+            ),
+          )}
         </View>
       )}
       {BROADCAST_ENABLED && <BroadcastControls />}
@@ -195,6 +219,43 @@ function PairingMenu({ visible, code, status, onCode, onReset, onClose }: {
   );
 }
 
+/**
+ * Shown while Bluetooth is off (or the app can't check it). UWB needs Bluetooth, and without it iOS pauses every
+ * ranging session, so this explains why and lets the user carry on with approximate (yellow) positions.
+ */
+function BluetoothDialog({ visible, state, onContinue }: {
+  visible: boolean;
+  state: UwbStatus['bluetooth'];
+  onContinue: () => void;
+}) {
+  const unauthorized = state === 'unauthorized';
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onContinue}>
+      <View style={styles.dialogBackdrop}>
+        <View style={styles.dialog}>
+          <Text style={styles.sheetTitle}>{unauthorized ? 'Allow Bluetooth' : 'Turn on Bluetooth'}</Text>
+          <Text style={styles.dialogText}>
+            {unauthorized
+              ? 'UWBHud needs Bluetooth permission to check that UWB can run. Allow Bluetooth for UWBHud in Settings.'
+              : 'UWB distance and direction need Bluetooth. Turn it on in Settings → Bluetooth (Control Center alone may not be enough), and make sure Airplane Mode is off.'}
+          </Text>
+          <Text style={styles.dialogText}>
+            Without it, other phones show in yellow: their position is a rough estimate, or unavailable.
+          </Text>
+          {unauthorized && (
+            <Pressable accessibilityRole="button" style={[styles.button, styles.dialogButton]} onPress={() => void Linking.openSettings()}>
+              <Text style={styles.buttonText}>Open Settings</Text>
+            </Pressable>
+          )}
+          <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet, styles.dialogButton]} onPress={onContinue}>
+            <Text style={styles.buttonText}>Continue without UWB</Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 /** Arrow pinned to the screen edge for a peer that's off screen (the native view draws on-screen tags). */
 function EdgeArrow({ peer }: { peer: UwbPeer }) {
   const { width, height } = useWindowDimensions();
@@ -208,11 +269,12 @@ function EdgeArrow({ peer }: { peer: UwbPeer }) {
 
   return (
     <View pointerEvents="none" style={[styles.edge, { left: cx + peer.dirX * r - 55, top: cy + peer.dirY * r - 30 }]}>
-      <Text style={[styles.arrow, { transform: [{ rotate: `${angle}rad` }] }]}>➤</Text>
+      <Text style={[styles.arrow, peer.approximate && styles.arrowApproximate, { transform: [{ rotate: `${angle}rad` }] }]}>➤</Text>
       <Text style={styles.edgeText}>{peer.name}</Text>
       <Text style={styles.edgeText}>
-        {peer.estimated ? '~' : ''}
+        {peer.estimated || peer.approximate ? '~' : ''}
         {formatDistance(peer.distance)}
+        {peer.uwbOffHere || peer.uwbOffThere ? ' · no UWB' : ''}
       </Text>
     </View>
   );
@@ -253,6 +315,12 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 12, paddingVertical: 6,
   },
   arrow: { color: '#34c759', fontSize: 22 },
+  arrowApproximate: { color: '#ffcc00' },
+  noUwbText: { color: '#ffcc00' },
+  dialogBackdrop: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: 'rgba(0,0,0,0.6)' },
+  dialog: { backgroundColor: '#1c1c1e', borderRadius: 16, padding: 20, borderWidth: 1, borderColor: '#ffcc00' },
+  dialogText: { color: '#ddd', fontSize: 15, marginTop: 10, lineHeight: 21 },
+  dialogButton: { flex: 0, marginTop: 14 },
   edgeText: { color: 'white', fontSize: 12, fontWeight: '600' },
   pairButton: {
     width: 48, minHeight: 44, alignItems: 'center', justifyContent: 'center',
