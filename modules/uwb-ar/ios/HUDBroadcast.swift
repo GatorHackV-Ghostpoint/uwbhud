@@ -45,7 +45,7 @@ final class HUDBroadcast: NSObject, RTCPeerConnectionDelegate, RPScreenRecorderD
         guard pc == nil, !stoppingCapture, !startingCapture else { throw failure("Broadcast is busy; stop it before restarting.") }
         guard let url = URL(string: value), url.scheme == "https", url.host != nil,
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
-              url.path == "/media/hud/whip" else {
+              url.path.range(of: #"^/media/[A-Za-z0-9-]+/whip$"#, options: .regularExpression) != nil else {
             throw failure("Enter the HTTPS HUD WHIP URL.")
         }
         guard recorder.isAvailable, !recorder.isRecording else { throw failure("Screen capture is unavailable or already in use.") }
@@ -190,7 +190,7 @@ final class HUDBroadcast: NSObject, RTCPeerConnectionDelegate, RPScreenRecorderD
                 // Never forward credentials to an origin supplied by a redirect/Location.
                 let safe = candidate.flatMap { url -> URL? in
                     url.scheme == endpoint.scheme && url.host == endpoint.host && url.port == endpoint.port
-                        && url.path.hasPrefix("/media/hud/whip/") ? url : nil
+                        && url.path.hasPrefix(endpoint.path + "/") ? url : nil
                 }
                 guard self.generation == run else {
                     if let safe { self.delete(safe, auth: auth) }
