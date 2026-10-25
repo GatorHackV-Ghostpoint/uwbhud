@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Button, StyleSheet, Text, TextInput, View } from 'react-native';
 import { requireNativeModule } from 'expo';
 
 const native = requireNativeModule('UwbAr');
 type Room = { revision?: number; canPlace?: boolean; point: { id: string; name?: string; placement?: string; reference: object } | null };
-export function WaypointControls({ server, device }: { server: string; device: string }) {
+// Memoized: App re-renders ~30x/sec with peer updates, and none of them change these props.
+export const WaypointControls = memo(function WaypointControls({ server, device }: { server: string; device: string }) {
   const [allowed, setAllowed] = useState(false);
   const [message, setMessage] = useState('Waiting for waypoint permission…');
   const [hasPoint, setHasPoint] = useState(false);
@@ -110,7 +111,7 @@ export function WaypointControls({ server, device }: { server: string; device: s
       </View>
     </>}
   </View>;
-}
+});
 const styles = StyleSheet.create({
   panel: { borderWidth: 1, borderColor: '#ffbd42', borderRadius: 3, padding: 5, marginTop: 4, backgroundColor: '#211b10' },
   title: { color: '#ffbd42', fontWeight: 'bold', fontSize: 12, textAlign: 'center' },

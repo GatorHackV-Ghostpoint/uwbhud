@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { requireNativeModule } from 'expo';
 
@@ -89,7 +89,9 @@ export function useBroadcast(): Broadcast {
       if (mounted.current) setStatus({ state: 'error', message: error instanceof Error ? error.message : 'Broadcast failed' });
     } finally { if (mounted.current) setPending(false); }
   }, [active, release]);
-  return { status, slot, pending, device, active, checkServer, toggle };
+  // Stable between renders unless something changed, so the memoized sheet skips the 30 Hz peer updates.
+  return useMemo(() => ({ status, slot, pending, device, active, checkServer, toggle }),
+    [status, slot, pending, device, active, checkServer, toggle]);
 }
 
 const STATE_LABEL: Record<string, string> = {

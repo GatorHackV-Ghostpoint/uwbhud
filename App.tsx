@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Animated, LayoutAnimation, Linking, Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput,
   useWindowDimensions, View, type StyleProp, type ViewProps, type ViewStyle,
@@ -27,6 +27,10 @@ export default function App() {
   const [name] = useState(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase());
   const supported = useMemo(() => isUwbSupported(), []);
   const broadcast = useBroadcast();
+  // Stable callbacks, so the memoized sheet and dialog don't re-render on every peer update (~30x/sec).
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+  const resetPairing = useCallback(() => setResetKey((k) => k + 1), []);
+  const continueWithoutUwb = useCallback(() => setBluetoothDismissed(true), []);
 
   if (!supported) {
     return (
@@ -95,7 +99,7 @@ export default function App() {
       <BluetoothDialog
         visible={bluetoothProblem && !bluetoothDismissed && !menuOpen}
         state={bluetooth}
-        onContinue={() => setBluetoothDismissed(true)}
+        onContinue={continueWithoutUwb}
       />
 
       <PairingMenu
@@ -105,8 +109,8 @@ export default function App() {
         linked={linked}
         broadcast={broadcast}
         onCode={setPairingCode}
-        onReset={() => setResetKey((k) => k + 1)}
-        onClose={() => setMenuOpen(false)}
+        onReset={resetPairing}
+        onClose={closeMenu}
       />
 
       <View style={styles.bottomStack} pointerEvents="box-none">
@@ -143,7 +147,7 @@ export default function App() {
  * phones using the same code connect, so you get exactly the phone you mean, even in a room full of them.
  * Broadcast: share this screen with the dashboard. It stays grayed out until a phone is linked.
  */
-function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset, onClose }: {
+const PairingMenu = memo(function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset, onClose }: {
   visible: boolean;
   code: string;
   status: UwbStatus | null;
@@ -279,13 +283,13 @@ function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset
       </View>
     </Modal>
   );
-}
+});
 
 /**
  * Shown while Bluetooth is off (or the app can't check it). UWB needs Bluetooth, and without it iOS pauses every
  * ranging session, so this explains why and lets the user carry on with approximate (yellow) positions.
  */
-function BluetoothDialog({ visible, state, onContinue }: {
+const BluetoothDialog = memo(function BluetoothDialog({ visible, state, onContinue }: {
   visible: boolean;
   state: UwbStatus['bluetooth'];
   onContinue: () => void;
@@ -316,7 +320,7 @@ function BluetoothDialog({ visible, state, onContinue }: {
       </View>
     </Modal>
   );
-}
+});
 
 /** A panel: Liquid Glass where the system supports it, otherwise the given translucent fill. */
 function Surface({ style, fallback, children, ...rest }: ViewProps & { fallback: StyleProp<ViewStyle> }) {
