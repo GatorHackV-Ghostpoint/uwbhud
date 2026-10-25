@@ -59,6 +59,7 @@ final class PeerLink: NSObject {
     var onDisconnected: ((MCPeerID) -> Void)?
     var onToken: ((MCPeerID, NIDiscoveryToken) -> Void)?
     var onState: ((MCPeerID, PeerState) -> Void)?
+    var onUwbAvailable: ((MCPeerID, Bool) -> Void)?   // the other phone can (or can no longer) run UWB
     var onLog: ((String) -> Void)?     // shown as the status line
     var onEvent: ((String) -> Void)?   // pairing timeline only
 
@@ -66,9 +67,11 @@ final class PeerLink: NSObject {
     static let inviteTimeout: TimeInterval = 8
     /// The higher-ranked phone waits this long for the other's invite before inviting itself.
     static let inviteGrace: TimeInterval = 3
+    /// A connect that hasn't finished by now is treated as failed, so the phone can be invited again.
+    static let connectTimeout: TimeInterval = 15
 
     /// First byte of every message. Builds before this sent a bare archived token, which starts with "b".
-    private enum Kind: UInt8 { case token = 1, state = 2 }
+    private enum Kind: UInt8 { case token = 1, state = 2, uwb = 3 }
 
     private struct Found {
         var rank: String
@@ -84,7 +87,7 @@ final class PeerLink: NSObject {
     private let myRank = UUID().uuidString        // decides who invites first
     private var found: [MCPeerID: Found] = [:]    // visible phones with our code (or none, in automatic mode)
     private var invited: [MCPeerID: TimeInterval] = [:]   // our invites in flight, by when sent
-    private var connecting = Set<MCPeerID>()
+    private var connecting: [MCPeerID: TimeInterval] = [:]   // by when the connect started
     private var retry: Timer?
 
     init(displayName: String, code: String?) {
@@ -140,6 +143,13 @@ final class PeerLink: NSObject {
         try? session.send(data, toPeers: [peer], with: .unreliable)
     }
 
+    /// Tells a phone whether we can run UWB right now (we can't with Bluetooth off), so it can say so instead
+    /// of waiting for readings that will never come.
+    func send(uwbAvailable: Bool, to peer: MCPeerID) {
+        guard session.connectedPeers.contains(peer) else { return }
+        try? session.send(Data([Kind.uwb.rawValue, uwbAvailable ? 1 : 0]), toPeers: [peer], with: .reliable)
+    }
+
     func isConnected(_ peer: MCPeerID) -> Bool { session.connectedPeers.contains(peer) }
     var isConnected: Bool { !session.connectedPeers.isEmpty }
 
@@ -148,8 +158,15 @@ final class PeerLink: NSObject {
     /// launch, or at range) and the lower-ranked phone may not see us at all.
     private func inviteDue() {
         let now = CACurrentMediaTime()
+        // MultipeerConnectivity sometimes never reports how a connect ended; without this the phone stays
+        // "connecting" forever and every later invite from it is declined.
+        for (peer, since) in connecting where now - since > Self.connectTimeout {
+            connecting[peer] = nil
+            invited[peer] = nil
+            onEvent?("Connect to \(peer.displayName) stalled; retrying")
+        }
         for (peer, f) in found {
-            guard !session.connectedPeers.contains(peer), !connecting.contains(peer) else { continue }
+            guard !session.connectedPeers.contains(peer), connecting[peer] == nil else { continue }
             if let sent = invited[peer], now - sent < Self.inviteTimeout + 1 { continue }
             guard myRank < f.rank || now - f.since > Self.inviteGrace else { continue }
             invited[peer] = now
@@ -168,6 +185,11 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
                 return
             }
             if self.found[peerID] == nil {
+                // Same name, new peer ID: that phone relaunched or re-paired. Stop inviting the old one.
+                for old in self.found.keys where old != peerID && old.displayName == peerID.displayName {
+                    self.found[old] = nil
+                    self.invited[old] = nil
+                }
                 self.found[peerID] = Found(rank: rank, since: CACurrentMediaTime())
                 self.onEvent?("Found \(peerID.displayName)")
             }
@@ -197,7 +219,7 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
             // If both phones invited each other at once, the lower rank's invite is the one that goes through.
             let crossed = self.invited[peerID] != nil && self.myRank < (self.found[peerID]?.rank ?? "")
             let accept = context == self.inviteContext && !crossed
-                && !self.session.connectedPeers.contains(peerID) && !self.connecting.contains(peerID)
+                && !self.session.connectedPeers.contains(peerID) && self.connecting[peerID] == nil
             self.onEvent?("\(peerID.displayName) invited us: " + (accept ? "accepted" : "declined"))
             invitationHandler(accept, self.session)
         }
@@ -207,23 +229,27 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
         DispatchQueue.main.async {
             switch state {
             case .connecting:
-                self.connecting.insert(peerID)
+                self.connecting[peerID] = CACurrentMediaTime()
                 self.onEvent?("Connecting to \(peerID.displayName)…")
             case .connected:
-                self.connecting.remove(peerID)
+                self.connecting[peerID] = nil
                 self.invited[peerID] = nil
                 self.onEvent?("Linked with \(peerID.displayName)")
                 self.onConnected?(peerID)
             case .notConnected:
-                let wasLinked = !self.connecting.contains(peerID)
-                self.connecting.remove(peerID)
+                let wasLinked = self.connecting[peerID] == nil
+                self.connecting[peerID] = nil
                 self.invited[peerID] = nil   // retry on the next tick instead of waiting out the timeout
                 self.found[peerID]?.since = CACurrentMediaTime()   // give the lower rank first go again
                 self.onEvent?(wasLinked ? "Link to \(peerID.displayName) dropped" : "Couldn't connect to \(peerID.displayName)")
                 self.onDisconnected?(peerID)
-                // Search again so a phone that went out of range is reported when it's back.
-                self.browser.stopBrowsingForPeers()
-                self.browser.startBrowsingForPeers()
+                // Search again so a phone that went out of range is reported when it's back. Only when no
+                // other phone is linked or connecting: restarting the browser makes every phone "lost" for a
+                // moment, so one flaky phone used to knock the rest of a 3-4 phone group into reconnecting.
+                if self.session.connectedPeers.isEmpty && self.connecting.isEmpty {
+                    self.browser.stopBrowsingForPeers()
+                    self.browser.startBrowsingForPeers()
+                }
             @unknown default: break
             }
         }
@@ -235,6 +261,11 @@ extension PeerLink: MCNearbyServiceBrowserDelegate, MCNearbyServiceAdvertiserDel
         if kind == .state {
             guard let state = PeerState(body) else { return }
             DispatchQueue.main.async { self.onState?(peerID, state) }
+            return
+        }
+        if kind == .uwb {
+            guard let flag = body.first else { return }
+            DispatchQueue.main.async { self.onUwbAvailable?(peerID, flag != 0) }
             return
         }
         let token = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NIDiscoveryToken.self, from: body)
