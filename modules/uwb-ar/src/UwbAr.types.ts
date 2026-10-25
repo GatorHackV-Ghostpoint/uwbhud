@@ -14,6 +14,8 @@ export type UwbPeer = {
   assistActive: boolean;
   /** Peer is in front of the camera (x/y are valid on-screen points). */
   inFront: boolean;
+  /** Inside the tag insets: the native view is drawing its name tag, so no edge arrow is needed. */
+  onScreen: boolean;
   /** Screen position in points, relative to the view. */
   x: number;
   y: number;
@@ -35,6 +37,8 @@ export type UwbStatus = {
 
 export type UwbArViewProps = ViewProps & {
   displayName?: string;
+  /** [top, bottom, side] margins kept clear for the HUD. Peers outside them get an edge arrow. */
+  tagInsets?: [number, number, number];
   onPeers?: (event: { nativeEvent: { peers: UwbPeer[] } }) => void;
   onStatus?: (event: { nativeEvent: UwbStatus }) => void;
 };

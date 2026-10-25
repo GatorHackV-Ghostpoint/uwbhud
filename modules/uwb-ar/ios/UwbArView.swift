@@ -5,17 +5,23 @@ import MultipeerConnectivity
 import RealityKit
 
 /// Native camera view for React Native.
-///   Native side: camera, UWB ranging, 3D marker dots (smooth 60 fps).
-///   JS side:     receives each peer's screen position ~15x/sec and draws the HUD (tags, arrows).
+///   Native side: camera, UWB ranging, 3D marker dots and on-screen name tags, every frame.
+///   JS side:     receives each peer's state ~30x/sec and draws the rest of the HUD (edge arrows, cards).
+/// Tags are native because a JS tag trails the camera image by several frames (event bridge +
+/// React render), sliding off the person whenever the phone pans.
 final class UwbArView: ExpoView {
     let onPeers = EventDispatcher()
     let onStatus = EventDispatcher()
     var displayName = "Phone"
+    /// Screen margins kept clear for the JS HUD; a peer outside them gets an edge arrow instead of a tag.
+    var tagInsets = (top: 130.0, bottom: 150.0, side: 30.0)
 
     private let arView = ARView(frame: .zero)
     private let markerRoot = AnchorEntity(world: .zero)
     private var tracker: UWBTracker?
     private var markers: [MCPeerID: ModelEntity] = [:]
+    private let tagLayer = UIView()
+    private var tags: [MCPeerID: PeerTagView] = [:]
     private var smoothed: [MCPeerID: SIMD3<Float>] = [:]
     private var updateSub: Cancellable?
     private var lastEmit: TimeInterval = 0
@@ -26,12 +32,15 @@ final class UwbArView: ExpoView {
         clipsToBounds = true
         arView.automaticallyConfigureSession = false
         addSubview(arView)
+        tagLayer.isUserInteractionEnabled = false
+        addSubview(tagLayer)
         arView.scene.addAnchor(markerRoot)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         arView.frame = bounds
+        tagLayer.frame = bounds
     }
 
     override func didMoveToWindow() {
@@ -63,6 +72,8 @@ final class UwbArView: ExpoView {
         arView.session.pause()
         markers.values.forEach { $0.removeFromParent() }
         markers.removeAll()
+        tags.values.forEach { $0.removeFromSuperview() }
+        tags.removeAll()
         smoothed.removeAll()
     }
 
@@ -81,24 +92,33 @@ final class UwbArView: ExpoView {
             seen.insert(peer)
             let stale = r.lastUpdate > 0 && now - r.lastUpdate > 2   // 0 = no reading yet, not "lost"
             var item: [String: Any] = ["id": "\(peer.hash)", "name": r.name, "stale": stale,
-                                       "hasPosition": false, "inFront": false, "cameraAssist": r.cameraAssist, "assistActive": r.assistActive,
+                                       "hasPosition": false, "inFront": false, "onScreen": false, "cameraAssist": r.cameraAssist, "assistActive": r.assistActive,
                                        "x": 0, "y": 0, "dirX": 0, "dirY": 0]
             if let d = r.distance { item["distance"] = Double(d) }
             if let g = r.guidance { item["guidance"] = g }
 
+            var tagPoint: CGPoint?
             if let target = r.worldPosition, !stale {
                 // The tracker already filters the readings; this just glides between UWB updates.
-                let p = smoothed[peer].map { $0 + (target - $0) * 0.25 } ?? target
+                let p = smoothed[peer].map { $0 + (target - $0) * 0.4 } ?? target
                 smoothed[peer] = p
                 let marker = markers[peer] ?? makeMarker(peer)
-                marker.position = p + SIMD3(0, 0.12, 0)
+                marker.position = p   // exactly at the measured point; the tag sits just above it
                 marker.isEnabled = true
 
                 let cam = viewMatrix * SIMD4(p, 1)   // camera space: -Z is in front
-                let s = camera.projectPoint(p, orientation: .portrait, viewportSize: size)
+                let inFront = cam.z < 0
+                // arView.project uses the same camera as the frame being drawn, so the tag stays on the sphere.
+                let s = (inFront ? arView.project(p) : nil)
+                    ?? camera.projectPoint(p, orientation: .portrait, viewportSize: size)
                 let len = max(hypot(Double(cam.x), Double(cam.y)), 1e-4)
+                let onScreen = inFront
+                    && Double(s.x) > tagInsets.side && Double(s.x) < Double(size.width) - tagInsets.side
+                    && Double(s.y) > tagInsets.top && Double(s.y) < Double(size.height) - tagInsets.bottom
+                if onScreen { tagPoint = s }
                 item["hasPosition"] = true
-                item["inFront"] = cam.z < 0
+                item["inFront"] = inFront
+                item["onScreen"] = onScreen
                 item["x"] = Double(s.x)
                 item["y"] = Double(s.y)
                 item["dirX"] = Double(cam.x) / len          // screen direction, y down
@@ -106,6 +126,7 @@ final class UwbArView: ExpoView {
             } else {
                 markers[peer]?.isEnabled = false
             }
+            updateTag(peer, name: r.name, distance: r.distance, at: tagPoint)
             payload.append(item)
         }
 
@@ -113,6 +134,10 @@ final class UwbArView: ExpoView {
             m.removeFromParent()
             markers[peer] = nil
             smoothed[peer] = nil
+        }
+        for (peer, tag) in tags where !seen.contains(peer) {
+            tag.removeFromSuperview()
+            tags[peer] = nil
         }
 
         // ~30 updates/sec so the labels glide with the camera instead of stepping.
@@ -128,11 +153,64 @@ final class UwbArView: ExpoView {
         }
     }
 
+    /// Shows the peer's tag with its bottom edge just above `point` (the sphere), or hides it.
+    private func updateTag(_ peer: MCPeerID, name: String, distance: Float?, at point: CGPoint?) {
+        guard let point else {
+            tags[peer]?.isHidden = true
+            return
+        }
+        let tag: PeerTagView
+        if let existing = tags[peer] {
+            tag = existing
+        } else {
+            tag = PeerTagView(name: name)
+            tagLayer.addSubview(tag)
+            tags[peer] = tag
+        }
+        tag.isHidden = false
+        tag.setDistance(distance)
+        tag.center = CGPoint(x: point.x, y: point.y - 14 - tag.bounds.height / 2)
+    }
+
     private func makeMarker(_ peer: MCPeerID) -> ModelEntity {
         let m = ModelEntity(mesh: .generateSphere(radius: 0.04),
                             materials: [SimpleMaterial(color: .systemGreen, isMetallic: false)])
         markerRoot.addChild(m)
         markers[peer] = m
         return m
+    }
+}
+
+/// Green name + distance pill, matching the JS HUD's style.
+private final class PeerTagView: UIView {
+    private let nameLabel = UILabel()
+    private let distanceLabel = UILabel()
+
+    init(name: String) {
+        super.init(frame: CGRect(x: 0, y: 0, width: 140, height: 48))
+        isUserInteractionEnabled = false
+        backgroundColor = UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 0.85)
+        layer.cornerRadius = 12
+        nameLabel.font = .systemFont(ofSize: 15, weight: .bold)
+        distanceLabel.font = .systemFont(ofSize: 13)
+        for label in [nameLabel, distanceLabel] {
+            label.textColor = .white
+            label.textAlignment = .center
+        }
+        nameLabel.text = name
+        let stack = UIStackView(arrangedSubviews: [nameLabel, distanceLabel])
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.frame = bounds.insetBy(dx: 4, dy: 6)
+        stack.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(stack)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func setDistance(_ meters: Float?) {
+        // Same format as the JS HUD's formatDistance.
+        let text = meters.map { $0 < 10 ? String(format: "%.2f m", $0) : String(format: "%.1f m", $0) } ?? "—"
+        if distanceLabel.text != text { distanceLabel.text = text }
     }
 }
