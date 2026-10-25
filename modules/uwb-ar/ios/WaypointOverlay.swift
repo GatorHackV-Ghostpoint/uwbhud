@@ -111,10 +111,15 @@ final class WaypointOverlay: NSObject {
         status(result.kind == "surface" ? "Sending waypoint…" : "Sending estimated waypoint…", hold: 2)
     }
 
+    /// Only touches the marker and label when something changes: this runs every frame.
+    private func show(marker visible: Bool) {
+        if marker.isEnabled != visible { marker.isEnabled = visible }
+        if !visible, !label.isHidden { label.isHidden = true }
+    }
+
     func tick(camera: ARCamera) {
-        marker.isEnabled = false
-        label.isHidden = true
         guard let arView, let tracker, let reference = WaypointBridge.reference else {
+            show(marker: false)
             if WaypointBridge.armed {
                 status(WaypointBridge.placementDistance == nil ? "Tap a visible surface to place the waypoint." : "Tap a direction for the estimated distance placement.")
             }
@@ -125,11 +130,12 @@ final class WaypointOverlay: NSObject {
               let xyz = reference["position"] as? [Double], xyz.count == 3,
               let p = tracker.mapWaypoint(SIMD3(Float(xyz[0]), Float(xyz[1]), Float(xyz[2])),
                                           from: peer, epoch: epoch.uint32Value, at: CACurrentMediaTime()) else {
+            show(marker: false)
             status("Waypoint shared. Waiting for peer AR alignment or valid tracking.")
             return
         }
         marker.position = p
-        marker.isEnabled = true
+        show(marker: true)
         let t = camera.transform.columns.3
         let distance = simd_distance(p, SIMD3(t.x, t.y, t.z))
         let cam = camera.viewMatrix(for: .portrait) * SIMD4(p, 1)
@@ -138,15 +144,18 @@ final class WaypointOverlay: NSObject {
         let kind = reference["placement"] as? String ?? "surface"
         let suffix = kind == "surface" ? "" : kind == "distance" ? " · distance" : " · estimated"
         let inside = cam.z < 0 && projected.map { arView.bounds.insetBy(dx: 100, dy: 130).contains($0) } == true
+        let text: String
         if inside, let projected {
             label.center = CGPoint(x: projected.x, y: projected.y - 48)
-            label.text = String(format: "◆ WAYPOINT\n%@\n%.1f m%@", name, distance, suffix)
+            text = String(format: "◆ WAYPOINT\n%@\n%.1f m%@", name, distance, suffix)
         } else {
             label.center = CGPoint(x: arView.bounds.midX, y: 160)
-            label.text = String(format: "◆ WAYPOINT · OFF SCREEN\n%@\n%.1f m%@", name, distance, suffix)
+            text = String(format: "◆ WAYPOINT · OFF SCREEN\n%@\n%.1f m%@", name, distance, suffix)
         }
-        label.isHidden = false
-        label.superview?.bringSubviewToFront(label)
+        if label.text != text { label.text = text }   // the distance is rounded, so this mostly holds still
+        if label.isHidden { label.isHidden = false }
+        // Peer tags share this layer and can be added later; keep the label above them without re-sorting every frame.
+        if let superview = label.superview, superview.subviews.last !== label { superview.bringSubviewToFront(label) }
         status(WaypointBridge.armed ? "Tap a surface to replace the waypoint." : "Shared waypoint active.")
     }
 }
