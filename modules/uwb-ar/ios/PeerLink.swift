@@ -1,21 +1,23 @@
 import MultipeerConnectivity
 import NearbyInteraction
 
-/// What each phone streams to the other ~30x/sec once linked, so the receiver can follow the sender
+/// What each phone streams to the other every AR frame (60x/sec) once linked, so the receiver can follow the sender
 /// with the sender's own ARKit tracking (see PoseAligner).
 struct PeerState {
+    var time: UInt32                // sender's clock (ms, wraps), for velocity from when poses were taken
     var epoch: UInt32               // bumped whenever the sender's AR world jumps (relocalization)
     var position: SIMD3<Float>?     // sender's phone in the sender's AR world; nil while tracking is poor
     var measurementSeq: UInt32      // bumped with each new UWB fix below
     var measurement: SIMD3<Float>?  // where the sender's UWB last put the receiver, in the sender's AR world
 
-    // Wire format (little-endian): epoch u32, flags u8, position 3×f32, seq u32, measurement 3×f32.
-    static let byteCount = 33
+    // Wire format (little-endian): time u32, epoch u32, flags u8, position 3×f32, seq u32, measurement 3×f32.
+    static let byteCount = 37
 
     func encoded() -> Data {
         var d = Data(capacity: Self.byteCount)
         func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
         func vec(_ p: SIMD3<Float>?) { let p = p ?? .zero; [p.x, p.y, p.z].forEach { u32($0.bitPattern) } }
+        u32(time)
         u32(epoch)
         d.append((position != nil ? 1 : 0) | (measurement != nil ? 2 : 0))
         vec(position)
@@ -24,7 +26,8 @@ struct PeerState {
         return d
     }
 
-    init(epoch: UInt32, position: SIMD3<Float>?, measurementSeq: UInt32, measurement: SIMD3<Float>?) {
+    init(time: UInt32, epoch: UInt32, position: SIMD3<Float>?, measurementSeq: UInt32, measurement: SIMD3<Float>?) {
+        self.time = time
         self.epoch = epoch
         self.position = position
         self.measurementSeq = measurementSeq
@@ -38,10 +41,11 @@ struct PeerState {
         func vec(_ i: Int) -> SIMD3<Float> {
             SIMD3(Float(bitPattern: u32(i)), Float(bitPattern: u32(i + 4)), Float(bitPattern: u32(i + 8)))
         }
-        epoch = u32(0)
-        position = b[4] & 1 != 0 ? vec(5) : nil
-        measurementSeq = u32(17)
-        measurement = b[4] & 2 != 0 ? vec(21) : nil
+        time = u32(0)
+        epoch = u32(4)
+        position = b[8] & 1 != 0 ? vec(9) : nil
+        measurementSeq = u32(21)
+        measurement = b[8] & 2 != 0 ? vec(25) : nil
     }
 }
 
@@ -105,7 +109,7 @@ final class PeerLink: NSObject {
         }
     }
 
-    /// Fire-and-forget: a lost pose is replaced by the next one 33 ms later, so no retransmits.
+    /// Fire-and-forget: a lost pose is replaced by the next one 17 ms later, so no retransmits.
     func send(state: PeerState, to peer: MCPeerID) {
         guard session.connectedPeers.contains(peer) else { return }
         var data = Data([Kind.state.rawValue])
