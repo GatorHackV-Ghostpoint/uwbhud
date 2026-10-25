@@ -82,7 +82,10 @@ function EdgeArrow({ peer }: { peer: UwbPeer }) {
     <View pointerEvents="none" style={[styles.edge, { left: cx + peer.dirX * r - 55, top: cy + peer.dirY * r - 30 }]}>
       <Text style={[styles.arrow, { transform: [{ rotate: `${angle}rad` }] }]}>➤</Text>
       <Text style={styles.edgeText}>{peer.name}</Text>
-      <Text style={styles.edgeText}>{formatDistance(peer.distance)}</Text>
+      <Text style={styles.edgeText}>
+        {peer.estimated ? '~' : ''}
+        {formatDistance(peer.distance)}
+      </Text>
     </View>
   );
 }
