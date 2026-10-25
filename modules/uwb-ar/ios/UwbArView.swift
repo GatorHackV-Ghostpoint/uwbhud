@@ -14,12 +14,22 @@ final class UwbArView: ExpoView {
     let onPeers = EventDispatcher()
     let onStatus = EventDispatcher()
     var displayName = "Phone"
+    /// Manual pairing: only connect to phones using this code. Empty = any nearby phone running the app.
+    /// Changing it re-pairs from scratch (the camera keeps running).
+    var pairingCode = "" {
+        didSet {
+            guard pairingCode != oldValue, tracker != nil else { return }
+            stopTracker()
+            startTracker()
+        }
+    }
     /// Screen margins kept clear for the JS HUD; a peer outside them gets an edge arrow instead of a tag.
     var tagInsets = (top: 130.0, bottom: 150.0, side: 30.0)
 
     private let arView = ARView(frame: .zero)
     private let markerRoot = AnchorEntity(world: .zero)
     private var tracker: UWBTracker?
+    private var waypointOverlay: WaypointOverlay?
     private let snapper = PersonSnapper()
     private var markers: [MCPeerID: ModelEntity] = [:]
     private let tagLayer = UIView()
@@ -30,6 +40,7 @@ final class UwbArView: ExpoView {
     private var updateSub: Cancellable?
     private var lastEmit: TimeInterval = 0
     private var lastStatus = ""
+    private var lastTimeline = ""
 
     required init(appContext: AppContext? = nil) {
         super.init(appContext: appContext)
@@ -60,23 +71,40 @@ final class UwbArView: ExpoView {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.isCollaborationEnabled = false
-        arView.session.run(config)
-
-        let t = UWBTracker(arSession: arView.session, displayName: displayName)
-        tracker = t
-        t.start()
-        snapper.onMatch = { [weak t] peer, snap, target in
-            t?.addCameraFix(for: peer, point: snap.point, target: target, at: snap.time)
+        config.planeDetection = [.horizontal, .vertical]
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
         }
+        arView.session.run(config)
+        startTracker()
         updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in self?.tick() }
     }
 
     private func stop() {
         updateSub?.cancel()
         updateSub = nil
+        stopTracker()
+        arView.session.pause()
+    }
+
+    private func startTracker() {
+        let t = UWBTracker(arSession: arView.session, displayName: displayName,
+                           pairingCode: pairingCode.isEmpty ? nil : pairingCode)
+        tracker = t
+        t.start()
+        waypointOverlay = WaypointOverlay(arView: arView, tracker: t, container: tagLayer)
+        snapper.onMatch = { [weak t] peer, snap, target in
+            t?.addCameraFix(for: peer, point: snap.point, target: target, at: snap.time)
+        }
+    }
+
+    private func stopTracker() {
+        waypointOverlay?.stop()
+        waypointOverlay = nil
         tracker?.stop()
         tracker = nil
-        arView.session.pause()
+        lastStatus = ""
+        lastTimeline = ""
         markers.values.forEach { $0.removeFromParent() }
         markers.removeAll()
         tags.values.forEach { $0.removeFromSuperview() }
@@ -91,6 +119,7 @@ final class UwbArView: ExpoView {
     private func tick() {
         guard let tracker, let frame = arView.session.currentFrame else { return }
         tracker.update(with: frame)
+        waypointOverlay?.tick(camera: frame.camera)
         let now = CACurrentMediaTime()
         let dt = Float(min(max(now - lastTick, 0), 0.1))   // time-based easing: same feel at any frame rate
         lastTick = now
@@ -181,9 +210,11 @@ final class UwbArView: ExpoView {
             lastEmit = now
             onPeers(["peers": payload])
         }
-        if tracker.status != lastStatus {
+        let timeline = tracker.timeline.last ?? ""
+        if tracker.status != lastStatus || timeline != lastTimeline {
             lastStatus = tracker.status
-            onStatus(["status": tracker.status,
+            lastTimeline = timeline
+            onStatus(["status": tracker.status, "timeline": tracker.timeline, "pairingCode": pairingCode,
                       "directionSupported": UWBTracker.supportsDirection || UWBTracker.supportsCameraAssistance,
                       "uwbSupported": UWBTracker.isSupported])
         }

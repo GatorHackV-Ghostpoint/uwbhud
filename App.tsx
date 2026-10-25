@@ -1,6 +1,9 @@
 import { useMemo, useState } from 'react';
-import { StatusBar, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import {
+  Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, useWindowDimensions, View,
+} from 'react-native';
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
+import { BroadcastControls } from './modules/uwb-ar/BroadcastControls';
 
 // Screen margins the HUD keeps clear (top status bar, bottom panel). Inside them the native view
 // draws each peer's name tag; outside them we draw an edge arrow.
@@ -10,6 +13,8 @@ const TAG_INSETS: [number, number, number] = [INSET.top, INSET.bottom, INSET.sid
 export default function App() {
   const [peers, setPeers] = useState<UwbPeer[]>([]);
   const [status, setStatus] = useState<UwbStatus | null>(null);
+  const [pairingCode, setPairingCode] = useState(''); // '' = automatic
+  const [menuOpen, setMenuOpen] = useState(false);
   const [name] = useState(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase());
   const supported = useMemo(() => isUwbSupported(), []);
 
@@ -31,6 +36,7 @@ export default function App() {
       <UwbArView
         style={StyleSheet.absoluteFill}
         displayName={name}
+        pairingCode={pairingCode}
         tagInsets={TAG_INSETS}
         onPeers={(e) => setPeers(e.nativeEvent.peers)}
         onStatus={(e) => setStatus(e.nativeEvent)}
@@ -40,14 +46,35 @@ export default function App() {
         <EdgeArrow key={p.id} peer={p} />
       ))}
 
-      <View style={[styles.card, styles.top]}>
-        <Text style={styles.cardText}>
-          {name} · {status?.status ?? 'Starting…'}
-        </Text>
-        {status && !status.directionSupported && (
-          <Text style={styles.warn}>This iPhone can measure distance but not direction</Text>
-        )}
+      {/* One row so the pairing button always matches the status bar's height. */}
+      <View style={styles.topBar}>
+        <View style={styles.topCard}>
+          <Text style={styles.cardText}>
+            {name} · {status?.status ?? 'Starting…'}
+          </Text>
+          {status && !status.directionSupported && (
+            <Text style={styles.warn}>This iPhone can measure distance but not direction</Text>
+          )}
+        </View>
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Pairing"
+          onPress={() => setMenuOpen(true)}
+          style={styles.pairButton}
+        >
+          <Text style={styles.pairIcon}>⇄</Text>
+          {pairingCode !== '' && <Text style={styles.pairBadge}>{pairingCode}</Text>}
+        </Pressable>
       </View>
+
+      <PairingMenu
+        visible={menuOpen}
+        code={pairingCode}
+        status={status}
+        onCode={setPairingCode}
+        onClose={() => setMenuOpen(false)}
+      />
 
       {waiting.length > 0 && (
         <View style={[styles.card, styles.bottom]}>
@@ -63,7 +90,96 @@ export default function App() {
           ))}
         </View>
       )}
+      <BroadcastControls />
     </View>
+  );
+}
+
+/**
+ * Pairing sheet. Automatic connects to any nearby phone running the app; with a code, only phones
+ * using the same code connect, so you get exactly the phone you mean, even in a room full of them.
+ */
+function PairingMenu({ visible, code, status, onCode, onClose }: {
+  visible: boolean;
+  code: string;
+  status: UwbStatus | null;
+  onCode: (code: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState('');
+  const join = () => {
+    if (draft.length >= 4) {
+      onCode(draft);
+      setDraft('');
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={styles.sheetBackdrop}>
+        <View style={styles.sheet}>
+          <View style={styles.sheetHeader}>
+            <Text style={styles.sheetTitle}>Pairing</Text>
+            <Pressable accessibilityRole="button" accessibilityLabel="Close" onPress={onClose} hitSlop={12}>
+              <Text style={styles.sheetClose}>✕</Text>
+            </Pressable>
+          </View>
+
+          {code ? (
+            <>
+              <Text style={styles.sheetLabel}>Pairing code</Text>
+              <Text style={styles.code}>{code}</Text>
+              <Text style={styles.sheetHint}>Enter this code on the other phone. Only phones using it will connect.</Text>
+            </>
+          ) : (
+            <Text style={styles.sheetHint}>Automatic: connects to any nearby phone running UWBHud.</Text>
+          )}
+
+          <View style={styles.row}>
+            <Pressable
+              accessibilityRole="button"
+              style={styles.button}
+              onPress={() => onCode(String(Math.floor(1000 + Math.random() * 9000)))}
+            >
+              <Text style={styles.buttonText}>{code ? 'New code' : 'Create code'}</Text>
+            </Pressable>
+            {code !== '' && (
+              <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet]} onPress={() => onCode('')}>
+                <Text style={styles.buttonText}>Use automatic</Text>
+              </Pressable>
+            )}
+          </View>
+
+          <View style={styles.row}>
+            <TextInput
+              value={draft}
+              onChangeText={(t) => setDraft(t.replace(/\D/g, '').slice(0, 6))}
+              onSubmitEditing={join}
+              placeholder="Enter code"
+              placeholderTextColor="#888"
+              keyboardType="number-pad"
+              returnKeyType="done"
+              style={styles.input}
+            />
+            <Pressable
+              accessibilityRole="button"
+              disabled={draft.length < 4}
+              style={[styles.button, draft.length < 4 && styles.buttonDisabled]}
+              onPress={join}
+            >
+              <Text style={styles.buttonText}>Join</Text>
+            </Pressable>
+          </View>
+
+          <Text style={styles.sheetLabel}>{status?.status ?? 'Starting…'}</Text>
+          <ScrollView style={styles.timeline}>
+            {(status?.timeline ?? []).map((line, i) => (
+              <Text key={i} style={styles.timelineText}>{line}</Text>
+            ))}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -109,7 +225,14 @@ const styles = StyleSheet.create({
     position: 'absolute', left: 12, right: 12,
     backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12, padding: 10,
   },
-  top: { top: 56 },
+  topBar: {
+    position: 'absolute', top: 56, left: 12, right: 12,
+    flexDirection: 'row', alignItems: 'stretch', gap: 8,
+  },
+  topCard: {
+    flex: 1, minHeight: 44, justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12, padding: 10,
+  },
   bottom: { bottom: 40 },
   cardText: { color: 'white', fontSize: 14, fontWeight: '600' },
   warn: { color: '#ffcc00', fontSize: 13, marginTop: 4 },
@@ -119,4 +242,35 @@ const styles = StyleSheet.create({
   },
   arrow: { color: '#34c759', fontSize: 22 },
   edgeText: { color: 'white', fontSize: 12, fontWeight: '600' },
+  pairButton: {
+    width: 48, minHeight: 44, alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 12,
+  },
+  pairIcon: { color: 'white', fontSize: 22, fontWeight: '700' },
+  pairBadge: { color: '#34c759', fontSize: 10, fontWeight: '700' },
+  sheetBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.35)' },
+  sheet: {
+    backgroundColor: '#1c1c1e', borderTopLeftRadius: 20, borderTopRightRadius: 20,
+    padding: 20, paddingBottom: 40, maxHeight: '80%',
+  },
+  sheetHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  sheetTitle: { color: 'white', fontSize: 20, fontWeight: '700' },
+  sheetClose: { color: '#aaa', fontSize: 20 },
+  sheetLabel: { color: '#aaa', fontSize: 13, fontWeight: '600', marginTop: 8 },
+  sheetHint: { color: '#ccc', fontSize: 14, marginTop: 4 },
+  code: { color: 'white', fontSize: 44, fontWeight: '800', letterSpacing: 8, marginVertical: 4 },
+  row: { flexDirection: 'row', gap: 10, marginTop: 14 },
+  button: {
+    flex: 1, minHeight: 44, borderRadius: 10, backgroundColor: '#34c759',
+    alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12,
+  },
+  buttonQuiet: { backgroundColor: '#3a3a3c' },
+  buttonDisabled: { opacity: 0.4 },
+  buttonText: { color: 'white', fontSize: 15, fontWeight: '700' },
+  input: {
+    flex: 2, minHeight: 44, borderRadius: 10, backgroundColor: '#2c2c2e',
+    color: 'white', fontSize: 18, paddingHorizontal: 12, letterSpacing: 4,
+  },
+  timeline: { marginTop: 6, maxHeight: 220 },
+  timelineText: { color: '#ddd', fontSize: 12, fontFamily: 'Menlo' },
 });
