@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  Linking, Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, useWindowDimensions, View,
+  Animated, LayoutAnimation, Linking, Modal, Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput,
+  useWindowDimensions, View,
 } from 'react-native';
 import { isUwbSupported, UwbArView, type UwbPeer, type UwbStatus } from './modules/uwb-ar';
 import { BroadcastPanel, SERVER, useBroadcast, type Broadcast } from './modules/uwb-ar/BroadcastControls';
@@ -152,6 +153,19 @@ function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset
   // A running broadcast can always be reached (to stop it), even if the link has since dropped.
   const canBroadcast = linked || broadcast.active;
   const mode = tab === 'broadcast' && canBroadcast ? 'broadcast' : 'pairing';
+  // The highlight slides between the two tab buttons; 0 = Pairing, 1 = Broadcast.
+  const [slide] = useState(() => new Animated.Value(0));
+  const [tabsWidth, setTabsWidth] = useState(0);
+  const segment = Math.max((tabsWidth - TAB_PAD * 2 - TAB_GAP) / 2, 0);
+  useEffect(() => {
+    Animated.spring(slide, { toValue: mode === 'broadcast' ? 1 : 0, useNativeDriver: true, speed: 18, bounciness: 5 }).start();
+  }, [mode, slide]);
+  const select = (next: 'pairing' | 'broadcast') => {
+    if (next === mode) return;
+    // The two tabs differ in height: let the sheet grow or shrink smoothly instead of jumping.
+    LayoutAnimation.configureNext(LayoutAnimation.create(260, LayoutAnimation.Types.easeInEaseOut, LayoutAnimation.Properties.opacity));
+    setTab(next);
+  };
   const join = () => {
     if (draft.length >= 4) {
       onCode(draft);
@@ -170,12 +184,19 @@ function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset
             </Pressable>
           </View>
 
-          <View style={styles.tabs} accessibilityRole="tablist">
+          <View style={styles.tabs} accessibilityRole="tablist" onLayout={(e) => setTabsWidth(e.nativeEvent.layout.width)}>
+            <Animated.View
+              pointerEvents="none"
+              style={[styles.tabHighlight, {
+                width: segment,
+                transform: [{ translateX: slide.interpolate({ inputRange: [0, 1], outputRange: [0, segment + TAB_GAP] }) }],
+              }]}
+            />
             <Pressable
               accessibilityRole="tab"
               accessibilityState={{ selected: mode === 'pairing' }}
-              style={[styles.tab, mode === 'pairing' && styles.tabSelected]}
-              onPress={() => setTab('pairing')}
+              style={styles.tab}
+              onPress={() => select('pairing')}
             >
               <Text style={styles.tabText}>Pairing</Text>
             </Pressable>
@@ -183,8 +204,8 @@ function PairingMenu({ visible, code, status, linked, broadcast, onCode, onReset
               accessibilityRole="tab"
               accessibilityState={{ selected: mode === 'broadcast', disabled: !canBroadcast }}
               disabled={!canBroadcast}
-              style={[styles.tab, mode === 'broadcast' && styles.tabSelected, !canBroadcast && styles.tabDisabled]}
-              onPress={() => setTab('broadcast')}
+              style={[styles.tab, !canBroadcast && styles.tabDisabled]}
+              onPress={() => select('broadcast')}
             >
               <Text style={styles.tabText}>Broadcast{broadcast.status.state === 'live' ? '  ●' : ''}</Text>
             </Pressable>
@@ -326,6 +347,9 @@ function formatDistance(m?: number) {
   return m < 10 ? `${m.toFixed(2)} m` : `${m.toFixed(1)} m`;
 }
 
+const TAB_PAD = 3;
+const TAB_GAP = 3;
+
 const styles = StyleSheet.create({
   fill: { flex: 1, backgroundColor: 'black' },
   center: { alignItems: 'center', justifyContent: 'center', padding: 24 },
@@ -362,9 +386,12 @@ const styles = StyleSheet.create({
   pairIcon: { color: 'white', fontSize: 22, fontWeight: '700' },
   pairBadge: { color: '#34c759', fontSize: 10, fontWeight: '700' },
   liveDot: { position: 'absolute', top: 6, right: 6, width: 8, height: 8, borderRadius: 4, backgroundColor: '#ff3b30' },
-  tabs: { flexDirection: 'row', backgroundColor: '#2c2c2e', borderRadius: 10, padding: 3, gap: 3 },
+  tabs: { flexDirection: 'row', backgroundColor: '#2c2c2e', borderRadius: 10, padding: TAB_PAD, gap: TAB_GAP },
+  tabHighlight: {
+    position: 'absolute', top: TAB_PAD, bottom: TAB_PAD, left: TAB_PAD, borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+  },
   tab: { flex: 1, minHeight: 36, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
-  tabSelected: { backgroundColor: '#48484a' },
   tabDisabled: { opacity: 0.35 },
   tabText: { color: 'white', fontSize: 14, fontWeight: '700' },
   tabHint: { color: '#8e8e93', fontSize: 12, marginTop: 6 },
