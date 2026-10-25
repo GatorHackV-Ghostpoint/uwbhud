@@ -12,7 +12,8 @@ Pod::Spec.new do |s|
   s.swift_version  = '5.9'
 
   s.dependency 'ExpoModulesCore'
-  s.frameworks = 'ARKit', 'RealityKit', 'NearbyInteraction', 'MultipeerConnectivity'
+  s.dependency 'WebRTC-lib', '154.0.0'
+  s.frameworks = 'ARKit', 'RealityKit', 'NearbyInteraction', 'MultipeerConnectivity', 'ReplayKit'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
