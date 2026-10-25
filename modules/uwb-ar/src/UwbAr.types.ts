@@ -28,6 +28,8 @@ export type UwbPeer = {
   fused: boolean;
   /** UWB hasn't confirmed the position lately (e.g. behind a wall); it's their AR tracking alone. */
   estimated: boolean;
+  /** The tag is snapped to the person the camera matched to this phone. */
+  snapped: boolean;
   /** No UWB reading for 2+ seconds and no AR tracking from them to fall back on. */
   stale: boolean;
 };
