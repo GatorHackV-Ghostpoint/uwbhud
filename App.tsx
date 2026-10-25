@@ -15,6 +15,7 @@ export default function App() {
   const [status, setStatus] = useState<UwbStatus | null>(null);
   const [pairingCode, setPairingCode] = useState(''); // '' = automatic
   const [menuOpen, setMenuOpen] = useState(false);
+  const [resetKey, setResetKey] = useState(0);
   const [name] = useState(() => 'Phone-' + Math.random().toString(36).slice(2, 6).toUpperCase());
   const supported = useMemo(() => isUwbSupported(), []);
 
@@ -37,6 +38,7 @@ export default function App() {
         style={StyleSheet.absoluteFill}
         displayName={name}
         pairingCode={pairingCode}
+        resetKey={resetKey}
         tagInsets={TAG_INSETS}
         onPeers={(e) => setPeers(e.nativeEvent.peers)}
         onStatus={(e) => setStatus(e.nativeEvent)}
@@ -73,6 +75,7 @@ export default function App() {
         code={pairingCode}
         status={status}
         onCode={setPairingCode}
+        onReset={() => setResetKey((k) => k + 1)}
         onClose={() => setMenuOpen(false)}
       />
 
@@ -99,11 +102,12 @@ export default function App() {
  * Pairing sheet. Automatic connects to any nearby phone running the app; with a code, only phones
  * using the same code connect, so you get exactly the phone you mean, even in a room full of them.
  */
-function PairingMenu({ visible, code, status, onCode, onClose }: {
+function PairingMenu({ visible, code, status, onCode, onReset, onClose }: {
   visible: boolean;
   code: string;
   status: UwbStatus | null;
   onCode: (code: string) => void;
+  onReset: () => void;
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState('');
@@ -170,6 +174,10 @@ function PairingMenu({ visible, code, status, onCode, onClose }: {
               <Text style={styles.buttonText}>Join</Text>
             </Pressable>
           </View>
+
+          <Pressable accessibilityRole="button" style={[styles.button, styles.buttonQuiet, styles.resetButton]} onPress={onReset}>
+            <Text style={styles.buttonText}>Reset pairing</Text>
+          </Pressable>
 
           <Text style={styles.sheetLabel}>{status?.status ?? 'Starting…'}</Text>
           <ScrollView style={styles.timeline}>
@@ -265,6 +273,7 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12,
   },
   buttonQuiet: { backgroundColor: '#3a3a3c' },
+  resetButton: { flex: 0, marginTop: 14 },
   buttonDisabled: { opacity: 0.4 },
   buttonText: { color: 'white', fontSize: 15, fontWeight: '700' },
   input: {

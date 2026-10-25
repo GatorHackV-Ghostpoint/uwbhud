@@ -49,6 +49,8 @@ export type UwbArViewProps = ViewProps & {
   displayName?: string;
   /** Only connect to phones using the same code. Empty or omitted = any nearby phone running the app. */
   pairingCode?: string;
+  /** Change this to drop every connection and pair again from scratch (same code). */
+  resetKey?: number;
   /** [top, bottom, side] margins kept clear for the HUD. Peers outside them get an edge arrow. */
   tagInsets?: [number, number, number];
   onPeers?: (event: { nativeEvent: { peers: UwbPeer[] } }) => void;
