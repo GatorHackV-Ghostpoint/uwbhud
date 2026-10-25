@@ -106,7 +106,7 @@ final class UWBTracker: NSObject {
     private var plainSessions = Set<MCPeerID>()   // peers where iOS rejected camera assistance
 
     // Our own ARKit pose, shared with the other phones.
-    private var epoch: UInt32 = 0                 // bumped when our AR world jumps
+    private var epoch: UInt32 = .random(in: 1...UInt32.max) // distinguish new AR worlds; bumped on jumps
     private var myPosition: SIMD3<Float>?         // nil while tracking isn't normal
     private var myPositionTime: TimeInterval = 0
     private var wasRelocalizing = false
@@ -364,6 +364,22 @@ final class UWBTracker: NSObject {
 
     /// Where to draw the peer now: their own tracking mapped into our world once the alignment is solid,
     /// otherwise the UWB position. Holds through UWB dropouts for up to 30 s while their poses keep coming.
+    func waypointReference(_ point: SIMD3<Float>) -> [String: Any]? {
+        guard myPosition != nil else { return nil }
+        return ["peer": link.myPeer.displayName, "epoch": Double(epoch),
+                "position": [Double(point.x), Double(point.y), Double(point.z)]]
+    }
+
+    func mapWaypoint(_ point: SIMD3<Float>, from name: String, epoch referenceEpoch: UInt32, at now: TimeInterval) -> SIMD3<Float>? {
+        guard myPosition != nil else { return nil }
+        if name == link.myPeer.displayName { return referenceEpoch == epoch ? point : nil }
+        let matches = readings.keys.filter { $0.displayName == name }
+        guard matches.count == 1, let peer = matches.first, let reading = readings[peer],
+              reading.theirEpoch == referenceEpoch, now - reading.lastPairTime < 30,
+              now - reading.theirPositionTime < 2 else { return nil }
+        return readings[peer]?.aligner.map(point, at: now)
+    }
+
     func fix(for peer: MCPeerID, at now: TimeInterval) -> PeerFix? {
         guard let r = readings[peer] else { return nil }
         let uwbFresh = r.lastUpdate > 0 && now - r.lastUpdate <= 2
