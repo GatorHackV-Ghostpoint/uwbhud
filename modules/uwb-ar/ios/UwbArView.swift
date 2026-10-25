@@ -51,6 +51,9 @@ final class UwbArView: ExpoView {
     private var lastStatus = ""
     private var lastTimeline = ""
     private var lastBluetooth = ""
+    /// Plane detection + LiDAR mesh: only on while this phone may place the waypoint (raycasting needs them),
+    /// so it's ready before Place is tapped. Everywhere else they're pure cost on top of tracking and UWB.
+    private var surfaceDetection = false
 
     required init(appContext: AppContext? = nil) {
         super.init(appContext: appContext)
@@ -77,17 +80,24 @@ final class UwbArView: ExpoView {
 
     private func start() {
         guard tracker == nil else { return }
+        surfaceDetection = WaypointBridge.canPlace
+        arView.session.run(Self.configuration(surfaces: surfaceDetection))
+        startTracker()
+        updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in self?.tick() }
+    }
+
+    private static func configuration(surfaces: Bool) -> ARWorldTrackingConfiguration {
         // Nearby Interaction camera assistance requires gravity alignment and no collaboration.
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.isCollaborationEnabled = false
-        config.planeDetection = [.horizontal, .vertical]
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            config.sceneReconstruction = .mesh
+        if surfaces {
+            config.planeDetection = [.horizontal, .vertical]
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+                config.sceneReconstruction = .mesh
+            }
         }
-        arView.session.run(config)
-        startTracker()
-        updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in self?.tick() }
+        return config
     }
 
     private func stop() {
@@ -128,6 +138,11 @@ final class UwbArView: ExpoView {
 
     private func tick() {
         guard let tracker, let frame = arView.session.currentFrame else { return }
+        if WaypointBridge.canPlace != surfaceDetection {
+            // Re-running without reset options keeps the AR world (and so UWB alignment and the waypoint) intact.
+            surfaceDetection = WaypointBridge.canPlace
+            arView.session.run(Self.configuration(surfaces: surfaceDetection))
+        }
         tracker.update(with: frame)
         waypointOverlay?.tick(camera: frame.camera)
         let now = CACurrentMediaTime()
