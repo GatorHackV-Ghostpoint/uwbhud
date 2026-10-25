@@ -24,7 +24,11 @@ export type UwbPeer = {
   dirY: number;
   /** What the user should do to get a direction lock, e.g. "Sweep phone slowly left and right". */
   guidance?: string;
-  /** No UWB reading for 2+ seconds. */
+  /** Position comes from the peer's own ARKit tracking, aligned to ours with UWB. */
+  fused: boolean;
+  /** UWB hasn't confirmed the position lately (e.g. behind a wall); it's their AR tracking alone. */
+  estimated: boolean;
+  /** No UWB reading for 2+ seconds and no AR tracking from them to fall back on. */
   stale: boolean;
 };
 

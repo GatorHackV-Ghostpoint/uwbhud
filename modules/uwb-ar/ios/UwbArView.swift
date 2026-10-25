@@ -5,7 +5,7 @@ import MultipeerConnectivity
 import RealityKit
 
 /// Native camera view for React Native.
-///   Native side: camera, UWB ranging, 3D marker dots and on-screen name tags, every frame.
+///   Native side: camera, UWB ranging, AR pose sharing, 3D marker dots and on-screen name tags, every frame.
 ///   JS side:     receives each peer's state ~30x/sec and draws the rest of the HUD (edge arrows, cards).
 /// Tags are native because a JS tag trails the camera image by several frames (event bridge +
 /// React render), sliding off the person whenever the phone pans.
@@ -81,6 +81,7 @@ final class UwbArView: ExpoView {
 
     private func tick() {
         guard let tracker, let frame = arView.session.currentFrame else { return }
+        tracker.update(with: frame)
         let now = CACurrentMediaTime()
         let camera = frame.camera
         let size = bounds.size
@@ -90,17 +91,23 @@ final class UwbArView: ExpoView {
 
         for (peer, r) in tracker.readings {
             seen.insert(peer)
-            let stale = r.lastUpdate > 0 && now - r.lastUpdate > 2   // 0 = no reading yet, not "lost"
+            let fix = tracker.fix(for: peer, at: now)
+            // 0 = no reading yet, not "lost". Their streamed AR pose keeps a peer alive through UWB dropouts.
+            let stale = r.lastUpdate > 0 && now - r.lastUpdate > 2 && fix == nil
             var item: [String: Any] = ["id": "\(peer.hash)", "name": r.name, "stale": stale,
                                        "hasPosition": false, "inFront": false, "onScreen": false, "cameraAssist": r.cameraAssist, "assistActive": r.assistActive,
+                                       "fused": fix?.fused ?? false, "estimated": fix?.estimated ?? false,
                                        "x": 0, "y": 0, "dirX": 0, "dirY": 0]
-            if let d = r.distance { item["distance"] = Double(d) }
+            let distance = fix?.distance ?? r.distance
+            if let d = distance { item["distance"] = Double(d) }
             if let g = r.guidance { item["guidance"] = g }
 
             var tagPoint: CGPoint?
-            if let target = r.worldPosition, !stale {
-                // The tracker already filters the readings; this just glides between UWB updates.
-                let p = smoothed[peer].map { $0 + (target - $0) * 0.4 } ?? target
+            if let fix {
+                let target = fix.position
+                // UWB positions step at the ranging rate, so glide between them. A fused position already
+                // moves smoothly with their own tracking; only take the edge off alignment updates.
+                let p = smoothed[peer].map { $0 + (target - $0) * (fix.fused ? 0.7 : 0.4) } ?? target
                 smoothed[peer] = p
                 let marker = markers[peer] ?? makeMarker(peer)
                 marker.position = p   // exactly at the measured point; the tag sits just above it
@@ -126,7 +133,8 @@ final class UwbArView: ExpoView {
             } else {
                 markers[peer]?.isEnabled = false
             }
-            updateTag(peer, name: r.name, distance: r.distance, at: tagPoint)
+            updateTag(peer, name: r.name, distance: distance, fused: fix?.fused ?? false,
+                      estimated: fix?.estimated ?? false, at: tagPoint)
             payload.append(item)
         }
 
@@ -154,7 +162,8 @@ final class UwbArView: ExpoView {
     }
 
     /// Shows the peer's tag with its bottom edge just above `point` (the sphere), or hides it.
-    private func updateTag(_ peer: MCPeerID, name: String, distance: Float?, at point: CGPoint?) {
+    private func updateTag(_ peer: MCPeerID, name: String, distance: Float?, fused: Bool, estimated: Bool,
+                           at point: CGPoint?) {
         guard let point else {
             tags[peer]?.isHidden = true
             return
@@ -168,7 +177,8 @@ final class UwbArView: ExpoView {
             tags[peer] = tag
         }
         tag.isHidden = false
-        tag.setDistance(distance)
+        tag.setDistance(distance, fused: fused, estimated: estimated)
+        tag.alpha = estimated ? 0.55 : 1
         tag.center = CGPoint(x: point.x, y: point.y - 14 - tag.bounds.height / 2)
     }
 
@@ -208,9 +218,12 @@ private final class PeerTagView: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func setDistance(_ meters: Float?) {
+    /// "~" while UWB isn't confirming the position; "· AR" when it comes from their ARKit tracking.
+    func setDistance(_ meters: Float?, fused: Bool, estimated: Bool) {
         // Same format as the JS HUD's formatDistance.
-        let text = meters.map { $0 < 10 ? String(format: "%.2f m", $0) : String(format: "%.1f m", $0) } ?? "—"
+        var text = meters.map { $0 < 10 ? String(format: "%.2f m", $0) : String(format: "%.1f m", $0) } ?? "—"
+        if estimated { text = "~" + text }
+        if fused { text += " · AR" }
         if distanceLabel.text != text { distanceLabel.text = text }
     }
 }
